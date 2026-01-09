@@ -1,5 +1,5 @@
 """
-Train model. Run as:
+Train model with TriOD (Triangular Ordered Dropout) support. Run as:
 
 python base_train.py
 
@@ -7,15 +7,20 @@ or distributed as:
 
 torchrun --nproc_per_node=8 base_train.py
 
+TriOD enables training a single model that can be efficiently subsampled at
+inference time to produce multiple smaller models of varying capacity.
+
 If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
 python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 --eval_tokens=512 --core_metric_every=-1 --total_batch_size=512 --num_iterations=20
 """
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import math
 import time
 from contextlib import nullcontext
 
+import numpy as np
 import wandb
 import torch
 
@@ -26,6 +31,7 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
+from triod.utils import test_prefix_od
 from scripts.base_eval import evaluate_model
 print_banner()
 
@@ -37,6 +43,13 @@ device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, i
 # Model architecture
 depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
 max_seq_len = 2048 # max context length
+# TriOD (Triangular Ordered Dropout) settings
+triangular = True  # Enable triangular ordered dropout for prefix invariance
+min_p = 0.2  # Minimum p for smallest submodel (fraction of neurons)
+num_models = 5  # Number of submodels to train simultaneously
+kl_alpha_max = 0.5  # Maximum KL alpha (weight for distillation loss)
+kl_alpha_cosine = True  # Use cosine schedule for KL alpha (starts at 0, ends at kl_alpha_max)
+test_prefix_every = 1000  # Test prefix invariance every N steps (-1 = disable)
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
@@ -110,7 +123,7 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # Initialize the Model
 
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, triangular=triangular, min_p=min_p, num_models=num_models)
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
     model = GPT(model_config)
@@ -188,6 +201,15 @@ def get_lr_multiplier(it):
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * final_lr_frac
 
+# TriOD: KL alpha scheduler (cosine schedule for gradual knowledge transfer)
+def get_kl_alpha(it):
+    """Get KL alpha with optional cosine schedule."""
+    if kl_alpha_cosine:
+        # Cosine schedule: starts at 0, reaches kl_alpha_max at end
+        return kl_alpha_max * (1 - math.cos(math.pi * it / num_iterations)) / 2.0
+    else:
+        return kl_alpha_max
+
 # Momentum scheduler for Muon optimizer
 def get_muon_momentum(it):
     frac = min(it / 300, 1)
@@ -201,6 +223,7 @@ if not resuming:
     step = 0
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
+    smooth_kl_loss = 0  # EMA of KL loss (TriOD)
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
@@ -208,7 +231,11 @@ else:
     val_bpb = meta_data["val_bpb"]
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
+    smooth_kl_loss = loop_state.get("smooth_kl_loss", 0)  # TriOD
     total_training_time = loop_state["total_training_time"]
+
+# TriOD: p_s for submodel evaluation
+p_s = np.linspace(min_p, 1.0, num_models) if triangular else np.array([1.0])
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -233,6 +260,16 @@ while True:
             "val/bpb": val_bpb,
         })
         model.train()
+
+    # TriOD: Test prefix invariance
+    if triangular and test_prefix_every > 0 and (last_step or (step > 0 and step % test_prefix_every == 0)):
+        if master_process:
+            print0(f"Step {step:05d} | Testing prefix invariance...")
+            model.eval()
+            with autocast_ctx:
+                test_input = torch.randint(0, vocab_size, (2, 32), device=device)
+                test_prefix_od(orig_model, device, test_input, p_s)
+            model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
@@ -289,6 +326,7 @@ while True:
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
+                    "smooth_kl_loss": smooth_kl_loss,  # TriOD
                     "total_training_time": total_training_time,
                 },
             },
@@ -300,14 +338,26 @@ while True:
         break
 
     # -------------------------------------------------------------------------
-    # single training step
+    # single training step with TriOD KL loss
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    
+    # TriOD: Get KL alpha for this step
+    kl_alpha = get_kl_alpha(step)
+    
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            if triangular and num_models > 1:
+                # TriOD: Use forward_with_kl_loss for training with distillation
+                loss, ce_loss, kl_loss = model.forward_with_kl_loss(x, y, kl_alpha=kl_alpha)
+            else:
+                # Standard training without KL loss
+                loss = model(x, y)
+                ce_loss = loss
+                kl_loss = torch.tensor(0.0)
         train_loss = loss.detach() # for logging
+        train_kl_loss = kl_loss.detach() if isinstance(kl_loss, torch.Tensor) else kl_loss
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
@@ -335,7 +385,9 @@ while True:
     # logging
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
+    smooth_kl_loss = ema_beta * smooth_kl_loss + (1 - ema_beta) * (train_kl_loss.item() if isinstance(train_kl_loss, torch.Tensor) else train_kl_loss)  # TriOD
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    debiased_smooth_kl = smooth_kl_loss / (1 - ema_beta**(step + 1))  # TriOD
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
@@ -344,13 +396,16 @@ while True:
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    # TriOD: Include KL loss and alpha in logging
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | kl: {debiased_smooth_kl:.6f} | kl_α: {kl_alpha:.4f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
     if step % 100 == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
+            "train/kl_loss": debiased_smooth_kl,  # TriOD
+            "train/kl_alpha": kl_alpha,  # TriOD
             "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,
@@ -382,6 +437,12 @@ get_report().log(section="Base model training", data=[
         "warmup_ratio": warmup_ratio,
         "warmdown_ratio": warmdown_ratio,
         "final_lr_frac": final_lr_frac,
+        # TriOD parameters
+        "triangular": triangular,
+        "min_p": min_p,
+        "num_models": num_models,
+        "kl_alpha_max": kl_alpha_max,
+        "kl_alpha_cosine": kl_alpha_cosine,
     },
     { # stats about training outcomes
         "Minimum validation bpb": min_val_bpb,
