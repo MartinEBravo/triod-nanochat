@@ -316,10 +316,13 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
 
-        # TriOD: Apply p to embedding (slice to submodel dimension)
+        # TriOD: Quantize p to align with head boundaries
         if p is not None:
+            head_dim = self.n_embd // self.n_head
             keep_heads = max(1, math.ceil(self.n_head * p))
-            keep_dim = keep_heads * (self.n_embd // self.n_head)
+            keep_dim = keep_heads * head_dim
+            # Recalculate p based on head-aligned dimension
+            p = keep_dim / self.n_embd
             x = x[:, :, :keep_dim]
 
         for block in self.transformer.h:
