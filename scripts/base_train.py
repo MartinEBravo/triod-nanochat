@@ -50,11 +50,11 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=int, default=8, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
-# TriOD-specific arguments
+# TriOD-specific parameters (defaults deactivated)
 parser.add_argument("--triangular", action="store_true", help="use TriOD (triangular ordered dropout) during training")
-parser.add_argument("--num-models", type=int, default=4, help="number of submodels in TriOD (only used if --triangular is set)")
-parser.add_argument("--min-p", type=float, default=0.5, help="minimum keep probability for smallest submodel in TriOD")
-parser.add_argument("--kl-alpha-max", type=float, default=0.1, help="maximum KL alpha for TriOD distillation loss")
+parser.add_argument("--num-models", type=int, default=0, help="number of submodels in TriOD (0 = disabled)")
+parser.add_argument("--min-p", type=float, default=0.5, help="smallest submodel in TriOD")
+parser.add_argument("--kl-alpha-max", type=float, default=0.0, help="maximum KL alpha for TriOD distillation loss (0 = disabled)")
 parser.add_argument("--kl-alpha-cosine", action="store_true", help="use cosine schedule for KL alpha (otherwise constant)")
 parser.add_argument("--test-prefix-every", type=int, default=0, help="test prefix invariance every N steps (0 = disable)")
 # Optimization

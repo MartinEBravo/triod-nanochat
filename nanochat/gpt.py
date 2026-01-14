@@ -52,10 +52,10 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "L"
-    # TriOD parameters
-    triangular: bool = True  # Enable triangular ordered dropout
-    min_p: float = 0.2  # Minimum p for smallest submodel
-    num_models: int = 5  # Number of submodels to train
+    # TriOD parameters (defaults deactivated)
+    triangular: bool = False  # Enable triangular ordered dropout
+    min_p: float = 0.5  # Minimum p for smallest submodel
+    num_models: int = 4  # Number of submodels to train
 
 
 def norm(x):
