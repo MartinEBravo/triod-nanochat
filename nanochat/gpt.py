@@ -1,5 +1,5 @@
 """
-GPT model with TriOD (Triangular Ordered Dropout) support.
+GPT model (rewrite, a lot simpler)
 Notable features:
 - rotary embeddings (and no positional embeddings)
 - QK norm
@@ -10,16 +10,11 @@ Notable features:
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
 - Flash Attention 3 integration
-- TriOD: Triangular connectivity for prefix invariance
-- TriOD: Support for p parameter to select submodel size
-- TriOD: all_models mode for training multiple submodels
 """
 
 from functools import partial
 from dataclasses import dataclass
-from typing import Any
 
-import numpy as np
 import math
 import torch
 import torch.nn as nn
@@ -37,7 +32,6 @@ os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 from kernels import get_kernel
 flash_attn = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 from triod.layers.linear import TriODLinear
-from triod.layers.layer_norm import TriODHeadLayerNorm
 from triod.utils import generate_structured_masked_x
 
 @dataclass
@@ -45,23 +39,59 @@ class GPTConfig:
     sequence_len: int = 1024
     vocab_size: int = 50304
     n_layer: int = 12
-    n_head: int = 6  # number of query heads
-    n_kv_head: int = 6  # number of key/value heads (GQA)
+    n_head: int = 6 # number of query heads
+    n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
-    # Sliding window attention pattern string, tiled across layers. Final layer always L.
-    # Characters: L=long (full context), S=short (half context)
-    # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
-    window_pattern: str = "L"
     # TriOD parameters (defaults deactivated)
     triangular: bool = False  # Enable triangular ordered dropout
     min_p: float = 0.5  # Minimum p for smallest submodel
     num_models: int = 4  # Number of submodels to train
+    # Sliding window attention pattern string, tiled across layers. Final layer always L.
+    # Characters: L=long (full context), S=short (half context)
+    # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
+    window_pattern: str = "L"
 
 
-def norm(x):
+def norm(
+    x,
+    triangular: bool,
+    *,
+    n_head: int | None = None,
+    eps: float = 1e-5,
+    ):
     # Purely functional rmsnorm with no learnable params
-    return F.rms_norm(x, (x.size(-1),))
+    if not triangular:
+        return F.rms_norm(x, (x.size(-1),))
 
+    assert n_head is not None, "triangular=True requires n_head"
+    # Case A: (B,T,C) -> reshape into heads
+    if x.ndim == 3:
+        B, T, C = x.shape
+        assert C % n_head == 0, f"C={C} must be divisible by n_head={n_head}"
+        D = C // n_head
+        x4 = x.view(B, T, n_head, D)
+    # Case B: (B,T,H,D) already
+    elif x.ndim == 4:
+        B, T, H, D = x.shape
+        assert H == n_head, f"H={H} must equal n_head={n_head} for triangular head-prefix norm"
+        x4 = x
+    else:
+        raise ValueError(f"Unsupported shape {tuple(x.shape)} for triod_norm")
+    # per-head sum of squares: (B,T,H)
+    s2 = (x4 * x4).sum(dim=-1)
+    # cumulative sum over heads: stats for heads 0..h
+    cs2 = s2.cumsum(dim=-1)  # (B,T,H)
+    # denom = (h+1)*D
+    idx = torch.arange(1, n_head + 1, device=x.device, dtype=x.dtype)  # (H,)
+    denom = (idx * D).view(1, 1, n_head)  # (1,1,H)
+    mean_sq = cs2 / denom                 # (B,T,H)
+    rms = torch.sqrt(mean_sq.unsqueeze(-1) + eps)  # (B,T,H,1)
+    y4 = x4 / rms
+    # reshape back if needed
+    if x.ndim == 3:
+        return y4.view(B, T, n_head * D)
+    else:
+        return y4
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
@@ -82,13 +112,10 @@ class CausalSelfAttention(nn.Module):
         self.triangular = config.triangular
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        # TriOD linear layers with triangular connectivity
         self.c_q = TriODLinear(self.n_embd, self.n_head * self.head_dim, bias=False, triangular=self.triangular)
         self.c_k = TriODLinear(self.n_embd, self.n_kv_head * self.head_dim, bias=False, triangular=self.triangular)
         self.c_v = TriODLinear(self.n_embd, self.n_kv_head * self.head_dim, bias=False, triangular=self.triangular)
         self.c_proj = TriODLinear(self.n_embd, self.n_embd, bias=False, triangular=self.triangular)
-        # TriOD LayerNorm for prefix-invariant normalization
-        self.ln = TriODHeadLayerNorm(self.n_embd, self.n_head, triangular=self.triangular)
 
     def forward(self, x, cos_sin, window_size, kv_cache, p=None):
         B, T, C = x.size()
@@ -97,24 +124,21 @@ class CausalSelfAttention(nn.Module):
         if p is not None:
             keep_heads = max(1, math.ceil(self.n_head * p))
             keep_kv_heads = max(1, math.ceil(self.n_kv_head * p))
-            cur_dim = keep_heads * self.head_dim
         else:
             keep_heads = self.n_head
             keep_kv_heads = self.n_kv_head
-            cur_dim = self.n_embd
-
-        # Apply TriOD LayerNorm
-        x_norm = self.ln(x)
-
         # Project the input to get queries, keys, and values
-        q = self.c_q(x_norm, p=p).view(B, T, keep_heads, self.head_dim)
-        k = self.c_k(x_norm, p=p).view(B, T, keep_kv_heads, self.head_dim)
-        v = self.c_v(x_norm, p=p).view(B, T, keep_kv_heads, self.head_dim)
+        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
+        q = self.c_q(x, p=p).view(B, T, keep_heads, self.head_dim)
+        k = self.c_k(x, p=p).view(B, T, keep_kv_heads, self.head_dim)
+        v = self.c_v(x, p=p).view(B, T, keep_kv_heads, self.head_dim)
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k) # QK norm
+        # QK norm with triangular head-prefix norm for TriOD
+        q = norm(q, triangular=self.triangular, n_head=keep_heads)
+        k = norm(k, triangular=self.triangular, n_head=keep_kv_heads)
 
         # Attention with Flash Attention 3
         # FA3 handles GQA automatically when n_kv_heads < n_heads
@@ -137,7 +161,7 @@ class CausalSelfAttention(nn.Module):
                 kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
-        y = y.contiguous().view(B, T, cur_dim)
+        y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y, p=p)
         return y
 
@@ -145,17 +169,10 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.triangular = config.triangular
-        self.n_embd = config.n_embd
-        self.n_head = config.n_head
-        # TriOD linear layers
-        self.c_fc = TriODLinear(config.n_embd, 4 * config.n_embd, bias=False, triangular=self.triangular)
-        self.c_proj = TriODLinear(4 * config.n_embd, config.n_embd, bias=False, triangular=self.triangular)
-        # TriOD LayerNorm
-        self.ln = TriODHeadLayerNorm(config.n_embd, config.n_head, triangular=self.triangular)
+        self.c_fc = TriODLinear(config.n_embd, 4 * config.n_embd, bias=False, triangular=config.triangular)
+        self.c_proj = TriODLinear(4 * config.n_embd, config.n_embd, bias=False, triangular=config.triangular)
 
     def forward(self, x, p=None):
-        x = self.ln(x)
         x = self.c_fc(x, p=p)
         x = F.relu(x).square()
         x = self.c_proj(x, p=p)
@@ -165,14 +182,19 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
+        self.config = config
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x, cos_sin, window_size, kv_cache, p=None):
-        # TriOD: pass p parameter through attention and MLP
-        # Note: norm is now inside attn and mlp for TriOD compatibility
-        x = x + self.attn(x, cos_sin, window_size, kv_cache, p=p)
-        x = x + self.mlp(x, p=p)
+        # Compute keep_heads for triangular norm
+        if p is not None:
+            keep_heads = max(1, math.ceil(self.config.n_head * p))
+        else:
+            keep_heads = self.config.n_head
+        
+        x = x + self.attn(norm(x, triangular=self.config.triangular, n_head=keep_heads), cos_sin, window_size, kv_cache, p=p)
+        x = x + self.mlp(norm(x, triangular=self.config.triangular, n_head=keep_heads), p=p)
         return x
 
 
@@ -185,11 +207,6 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
-        self.triangular = config.triangular
-        self.n_embd = config.n_embd
-        self.n_head = config.n_head
-        # Store p_s for submodel training (TriOD)
-        self.p_s = np.linspace(config.min_p, 1.0, config.num_models) if config.triangular else None
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -202,10 +219,7 @@ class GPT(nn.Module):
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
-        # TriOD: lm_head is never triangular (output dim is fixed)
         self.lm_head = TriODLinear(config.n_embd, padded_vocab_size, bias=False, triangular=False)
-        # TriOD: final LayerNorm is prefix-invariant
-        self.final_ln = TriODHeadLayerNorm(config.n_embd, config.n_head, triangular=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
@@ -219,7 +233,7 @@ class GPT(nn.Module):
         self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
         head_dim = config.n_embd // config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
 
     def init_weights(self):
@@ -387,84 +401,74 @@ class GPT(nn.Module):
         return optimizers
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', p=None, return_prelast=False, all_models=False):
-        """
-        Forward pass with TriOD support.
-        
-        Args:
-            idx: Input token indices (B, T)
-            targets: Target token indices for loss computation
-            kv_cache: Optional KV cache for inference
-            loss_reduction: 'mean' or 'none' for loss computation
-            p: Optional fraction of model to use (for inference with submodels)
-            return_prelast: Return pre-logit representations (for testing prefix invariance)
-            all_models: Generate outputs for all submodels (for training with KL loss)
-        """
         B, T = idx.size()
 
-        # Grab the rotary embeddings for the current sequence length
+        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
+        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
-        x = norm(x)
+        x = norm(x, triangular=self.config.triangular, n_head=self.config.n_head)
         x0 = x  # save initial normalized embedding for x0 residual
 
         # TriOD: Quantize p to align with head boundaries
         if p is not None:
-            head_dim = self.n_embd // self.n_head
-            keep_heads = max(1, math.ceil(self.n_head * p))
+            head_dim = self.config.n_embd // self.config.n_head
+            keep_heads = max(1, math.ceil(self.config.n_head * p))
             keep_dim = keep_heads * head_dim
             # Recalculate p based on head-aligned dimension
-            p = keep_dim / self.n_embd
+            p = keep_dim / self.config.n_embd
+            # Slice both x and x0 to maintain prefix invariance
             x = x[:, :, :keep_dim]
+            x0 = x0[:, :, :keep_dim]
 
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             x = block(x, cos_sin, self.window_sizes[i], kv_cache, p=p)
         
-        # TriOD: Use prefix-invariant final LayerNorm
-        x = self.final_ln(x)
+        # Final norm with triangular head-prefix norm
+        if p is not None:
+            keep_heads = max(1, math.ceil(self.config.n_head * p))
+        else:
+            keep_heads = self.config.n_head
+        x = norm(x, triangular=self.config.triangular, n_head=keep_heads)
 
         # Return pre-logit representations for testing prefix invariance
         if return_prelast:
             return x
 
         # TriOD: Generate outputs for all submodels
-        if all_models and self.p_s is not None:
-            x = generate_structured_masked_x(x, self.p_s)
+        if all_models and self.config.p_s is not None:
+            x = generate_structured_masked_x(x, self.config.p_s)
 
         # Forward the lm_head (compute logits)
-        softcap = 15  # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x, p=None)  # No triangular in lm_head
-        logits = logits[..., :self.config.vocab_size]  # slice to remove padding
-        logits = logits.float()  # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap)  # squash the logits
+        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
+        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
+        logits = logits[..., :self.config.vocab_size] # slice to remove padding
+        logits = logits.float() # switch to fp32 for logit softcap and loss computation
+        logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
         if targets is not None:
+            # training: given the targets, compute and return the loss
+            # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
+            # inference: just return the logits directly
             return logits
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42, p=None):
         """
-        Naive autoregressive streaming inference with TriOD submodel support.
+        Naive autoregressive streaming inference.
         To make it super simple, let's assume:
         - batch size is 1
         - ids and the yielded tokens are simple Python lists and ints
-        
-        Args:
-            tokens: List of starting token indices
-            max_tokens: Maximum number of tokens to generate
-            temperature: Sampling temperature
-            top_k: Top-k sampling parameter
-            seed: Random seed
-            p: Optional fraction of model to use (for submodel inference)
         """
         assert isinstance(tokens, list)
         device = self.get_device()
@@ -472,10 +476,10 @@ class GPT(nn.Module):
         if temperature > 0:
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
-        ids = torch.tensor([tokens], dtype=torch.long, device=device)  # add batch dim
+        ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
         for _ in range(max_tokens):
-            logits = self.forward(ids, p=p)  # TriOD: pass p for submodel inference
-            logits = logits[:, -1, :]  # (B, vocab_size)
+            logits = self.forward(ids, p=p) # (B, T, vocab_size)
+            logits = logits[:, -1, :] # (B, vocab_size)
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
