@@ -187,15 +187,27 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, cos_sin, window_size, kv_cache, p=None):
-        # Compute keep_heads for triangular norm
+        # Compute keep_heads and dimensions for triangular norm
         if p is not None:
             keep_heads = max(1, math.ceil(self.config.n_head * p))
+            head_dim = self.config.n_embd // self.config.n_head
+            keep_dim = keep_heads * head_dim
         else:
             keep_heads = self.config.n_head
+            keep_dim = self.config.n_embd
         
-        x = x + self.attn(norm(x, triangular=self.config.triangular, n_head=keep_heads), cos_sin, window_size, kv_cache, p=p)
-        x = x + self.mlp(norm(x, triangular=self.config.triangular, n_head=keep_heads), p=p)
-        return x
+        # Slice x for residual connections to match output dimensions
+        x_slice = x[..., :keep_dim]
+        x_slice = x_slice + self.attn(norm(x_slice, triangular=self.config.triangular, n_head=keep_heads), cos_sin, window_size, kv_cache, p=p)
+        x_slice = x_slice + self.mlp(norm(x_slice, triangular=self.config.triangular, n_head=keep_heads), p=p)
+        
+        # Put the updated slice back into x (for prefix invariance)
+        if p is not None:
+            x = x.clone()
+            x[..., :keep_dim] = x_slice
+            return x
+        else:
+            return x_slice
 
 
 class GPT(nn.Module):
@@ -423,9 +435,6 @@ class GPT(nn.Module):
             keep_dim = keep_heads * head_dim
             # Recalculate p based on head-aligned dimension
             p = keep_dim / self.config.n_embd
-            # Slice both x and x0 to maintain prefix invariance
-            x = x[:, :, :keep_dim]
-            x0 = x0[:, :, :keep_dim]
 
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
@@ -434,9 +443,17 @@ class GPT(nn.Module):
         # Final norm with triangular head-prefix norm
         if p is not None:
             keep_heads = max(1, math.ceil(self.config.n_head * p))
+            head_dim = self.config.n_embd // self.config.n_head
+            keep_dim = keep_heads * head_dim
+            # Slice x for normalization
+            x_slice = x[..., :keep_dim]
+            x_slice = norm(x_slice, triangular=self.config.triangular, n_head=keep_heads)
+            # Put normalized slice back for prefix invariance
+            x = x.clone()
+            x[..., :keep_dim] = x_slice
         else:
             keep_heads = self.config.n_head
-        x = norm(x, triangular=self.config.triangular, n_head=keep_heads)
+            x = norm(x, triangular=self.config.triangular, n_head=keep_heads)
 
         # Return pre-logit representations for testing prefix invariance
         if return_prelast:
@@ -492,33 +509,3 @@ class GPT(nn.Module):
             ids = torch.cat((ids, next_ids), dim=1)
             token = next_ids.item()
             yield token
-
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    config = GPTConfig(
-        sequence_len=128,
-        vocab_size=1000,
-        n_layer=4,
-        n_head=8,
-        n_kv_head=8,
-        n_embd=512,
-        window_pattern="SL",
-        triangular=True,
-        min_p=0.5,
-        num_models=4,
-    )
-
-    model = GPT(config).to(device)
-    model.init_weights()
-
-    B, T = 2, 128
-    x = torch.randint(0, config.vocab_size, (B, T), device=device, dtype=torch.long)
-
-    model.eval()
-
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=amp_dtype):
-        logits = model(x, p=0.75)
-
-    print("Logits shape:", logits.shape)
