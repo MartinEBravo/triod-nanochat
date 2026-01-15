@@ -488,3 +488,26 @@ class GPT(nn.Module):
             ids = torch.cat((ids, next_ids), dim=1)
             token = next_ids.item()
             yield token
+
+
+if __name__ == "__main__":
+    # Simple test of the GPT model with TriOD
+    config = GPTConfig(
+        sequence_len=128,
+        vocab_size=1000,
+        n_layer=4,
+        n_head=8,
+        n_kv_head=8,
+        n_embd=512,
+        window_pattern="SL",
+        triangular=True,
+        min_p=0.5,
+        num_models=4,
+    )
+    model = GPT(config)
+    model.init_weights()
+    B, T = 2, 128
+    x = torch.randint(0, config.vocab_size, (B, T))
+    model.eval()
+    logits = model(x)
+    print("Logits shape:", logits.shape)  # should be (B, T, vocab_size)
