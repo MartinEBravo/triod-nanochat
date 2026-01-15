@@ -489,9 +489,9 @@ class GPT(nn.Module):
             token = next_ids.item()
             yield token
 
-
 if __name__ == "__main__":
-    # Simple test of the GPT model with TriOD
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     config = GPTConfig(
         sequence_len=128,
         vocab_size=1000,
@@ -504,10 +504,17 @@ if __name__ == "__main__":
         min_p=0.5,
         num_models=4,
     )
-    model = GPT(config)
+
+    model = GPT(config).to(device)
     model.init_weights()
+
     B, T = 2, 128
-    x = torch.randint(0, config.vocab_size, (B, T))
+    x = torch.randint(0, config.vocab_size, (B, T), device=device, dtype=torch.long)
+
     model.eval()
-    logits = model(x)
-    print("Logits shape:", logits.shape)  # should be (B, T, vocab_size)
+
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=amp_dtype):
+        logits = model(x, p=0.75)
+
+    print("Logits shape:", logits.shape)
