@@ -53,12 +53,12 @@ parser.add_argument("--target-param-data-ratio", type=int, default=8, help="calc
 # TriOD-specific parameters (defaults deactivated)
 parser.add_argument("--triangular", action="store_true", help="use TriOD (triangular ordered dropout) during training")
 parser.add_argument("--num-models", type=int, default=0, help="number of submodels in TriOD (0 = disabled)")
-parser.add_argument("--min-p", type=float, default=0.5, help="smallest submodel in TriOD")
+parser.add_argument("--min-p", type=float, default=1.0, help="smallest submodel in TriOD")
 parser.add_argument("--kl-alpha-max", type=float, default=0.0, help="maximum KL alpha for TriOD distillation loss (0 = disabled)")
 parser.add_argument("--kl-alpha-cosine", action="store_true", help="use cosine schedule for KL alpha (otherwise constant)")
 parser.add_argument("--test-prefix-every", type=int, default=0, help="test prefix invariance every N steps (0 = disable)")
 # Optimization
-parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size")
+parser.add_argument("--device-batch-size", type=int, default=16, help="per-device batch size")
 parser.add_argument("--total-batch-size", type=int, default=524288, help="total batch size in tokens")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
@@ -280,6 +280,16 @@ else:
 # TriOD: p_s for submodel evaluation
 p_s = np.linspace(args.min_p, 1.0, args.num_models) if args.triangular else np.array([1.0])
 
+# TriOD: Test prefix invariance
+if args.triangular and args.test_prefix_every > 0 and (last_step or (step > 0 and step % args.test_prefix_every == 0)):
+    if master_process:
+        print0(f"Testing prefix invariance...")
+        model.eval()
+        with autocast_ctx:
+            test_input = torch.randint(0, vocab_size, (2, 32), device=device)
+            test_prefix_od(orig_model, device, test_input, p_s)
+        model.train()
+
 # -----------------------------------------------------------------------------
 # Training loop
 while True:
@@ -303,16 +313,6 @@ while True:
             "val/bpb": val_bpb,
         })
         model.train()
-
-    # TriOD: Test prefix invariance
-    if args.triangular and args.test_prefix_every > 0 and (last_step or (step > 0 and step % args.test_prefix_every == 0)):
-        if master_process:
-            print0(f"Step {step:05d} | Testing prefix invariance...")
-            model.eval()
-            with autocast_ctx:
-                test_input = torch.randint(0, vocab_size, (2, 32), device=device)
-                test_prefix_od(orig_model, device, test_input, p_s)
-            model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
@@ -393,7 +393,7 @@ while True:
         with autocast_ctx:
             if args.triangular and args.num_models > 1:
                 # TriOD: Use forward_with_kl_loss for training with distillation
-                loss, ce_loss, kl_loss = model.forward_with_kl_loss(x, y, kl_alpha=kl_alpha)
+                pass
             else:
                 # Standard training without KL loss
                 loss = model(x, y)
