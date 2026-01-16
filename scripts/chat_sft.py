@@ -16,6 +16,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import wandb
 import torch
 import torch.distributed as dist
+import numpy as np
 from contextlib import nullcontext
 
 from nanochat.common import compute_init, compute_cleanup, get_base_dir, print0, DummyWandb, autodetect_device_type
@@ -49,6 +50,12 @@ parser.add_argument("--num-iterations", type=int, default=-1, help="override num
 # Batch sizes
 parser.add_argument("--device-batch-size", type=int, default=4, help="per-device batch size")
 parser.add_argument("--target-examples-per-step", type=int, default=32, help="target examples per optimization step")
+# TriOD
+parser.add_argument("--triangular", action="store_true", help="use TriOD (triangular ordered dropout) during training")
+parser.add_argument("--num-models", type=int, default=0, help="number of submodels in TriOD (0 = disabled)")
+parser.add_argument("--min-p", type=float, default=1.0, help="smallest submodel in TriOD")
+parser.add_argument("--kl-alpha-max", type=float, default=0.0, help="maximum KL alpha for TriOD distillation loss (0 = disabled)")
+parser.add_argument("--kl-alpha-cosine", action="store_true", help="use cosine schedule for KL alpha (otherwise constant)")
 # Optimization
 parser.add_argument("--embedding-lr", type=float, default=0.2, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
@@ -80,6 +87,16 @@ model, tokenizer, meta = load_model(args.source, device, phase="train", model_ta
 orig_model = model # original, uncompiled model
 # model = torch.compile(model, dynamic=True) # doesn't work super well because of variable lengths of inputs
 engine = Engine(model, tokenizer) # will be used for inline model evaluation only
+
+# TriOD: Update model config with triangular and p_s
+if args.triangular:
+    p_s = np.linspace(args.min_p, 1.0, args.num_models) if args.num_models > 0 else np.array([1.0])
+    model.config.triangular = True
+    model.config.p_s = p_s
+    print0(f"TriOD enabled: num_models={args.num_models}, min_p={args.min_p}, p_s={p_s}")
+else:
+    p_s = np.array([1.0])
+    model.config.p_s = p_s
 
 # -----------------------------------------------------------------------------
 # Task data mixture we'll train on
@@ -170,6 +187,17 @@ def get_lr_multiplier(it):
     lrm = 1.0 - it / num_iterations
     return lrm
 
+# TriOD: KL alpha scheduler (cosine schedule for gradual knowledge transfer)
+def get_kl_alpha(it):
+    if args.kl_alpha_max <= 0:
+        return 0.0
+    if args.kl_alpha_cosine:
+        # Cosine schedule: starts at 0, peaks at kl_alpha_max around midpoint
+        progress = it / num_iterations if num_iterations > 0 else 0
+        return args.kl_alpha_max * 0.5 * (1 - np.cos(np.pi * progress))
+    else:
+        return args.kl_alpha_max
+
 # Go!
 step = 0
 for step in range(num_iterations):
@@ -215,13 +243,41 @@ for step in range(num_iterations):
     if last_step:
         break
 
+    # TriOD: Get KL alpha for this step
+    kl_alpha = get_kl_alpha(step)
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=-1)
+
     # evaluate the gradient
     num_tokens = torch.tensor(0, device=device) # the number of "active" tokens of supervision seen
+    train_kl_loss = torch.tensor(0.0, device=device)  # TriOD KL loss
     for micro_step in range(grad_accum_steps):
         train_inputs, train_targets = next(train_loader)
         with autocast_ctx:
-            loss = model(train_inputs, train_targets)
+            B = train_inputs.size(0)
+            kl_loss = torch.tensor(0.0, device=device)
+            if args.triangular and args.num_models > 1:
+                # TriOD: compute outputs for all submodels
+                output = model(train_inputs, all_models=True)
+                output_full = output[-B:]  # Full model output (last batch)
+                # Compute KL distillation loss from full model to submodels
+                output_submodels = output[:-B]
+                with torch.no_grad():
+                    soft_targets_prob = output_full.softmax(dim=-1)
+                # Flatten for cross entropy
+                output_submodels_flat = output_submodels.view(-1, output_submodels.size(-1))
+                targets_flat = soft_targets_prob.view(-1, soft_targets_prob.size(-1))
+                # Repeat targets for all submodels
+                num_submodels = args.num_models - 1  # exclude full model
+                targets_repeated = targets_flat.repeat(num_submodels, 1)
+                kl_loss = criterion(output_submodels_flat, targets_repeated)
+                # CE loss for full model
+                ce_loss = criterion(output_full.view(-1, output_full.size(-1)), train_targets.view(-1))
+                loss = ce_loss + kl_alpha * kl_loss
+            else:
+                # Standard training without KL loss
+                loss = model(train_inputs, train_targets)
         train_loss = loss.detach() # for logging
+        train_kl_loss = kl_loss.detach()
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward() # accumulate the gradient
         num_tokens += (train_targets >= 0).sum()
@@ -241,12 +297,16 @@ for step in range(num_iterations):
 
     # logging
     train_loss_item = train_loss.item()
+    train_kl_loss_item = train_kl_loss.item()
     num_tokens_item = num_tokens.item()
-    print0(f"Step {step:05d}/{num_iterations:05d} | Training loss: {train_loss_item:.6f}| lrm: {lrm:.6f}| num_tokens: {num_tokens_item:,}")
+    # TriOD: Include KL loss and alpha in logging
+    print0(f"Step {step:05d}/{num_iterations:05d} | Training loss: {train_loss_item:.6f} | KL: {train_kl_loss_item:.6f} | KL_α: {kl_alpha:.4f} | lrm: {lrm:.6f} | num_tokens: {num_tokens_item:,}")
     wandb_run.log({
         "step": step,
         "lrm": lrm,
         "train_loss": train_loss_item,
+        "train_kl_loss": train_kl_loss_item,  # TriOD
+        "kl_alpha": kl_alpha,  # TriOD
         "num_tokens": num_tokens_item,
     })
     step += 1

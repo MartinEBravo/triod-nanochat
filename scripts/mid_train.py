@@ -15,6 +15,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
+import numpy as np
 from contextlib import nullcontext
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_token_bytes
@@ -47,6 +48,12 @@ parser.add_argument("--num-iterations", type=int, default=-1, help="number of op
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--device-batch-size", type=int, default=16, help="per-device batch size")
 parser.add_argument("--total-batch-size", type=int, default=524288, help="total batch size in tokens")
+# TriOD
+parser.add_argument("--triangular", action="store_true", help="use TriOD (triangular ordered dropout) during training")
+parser.add_argument("--num-models", type=int, default=0, help="number of submodels in TriOD (0 = disabled)")
+parser.add_argument("--min-p", type=float, default=1.0, help="smallest submodel in TriOD")
+parser.add_argument("--kl-alpha-max", type=float, default=0.0, help="maximum KL alpha for TriOD distillation loss (0 = disabled)")
+parser.add_argument("--kl-alpha-cosine", action="store_true", help="use cosine schedule for KL alpha (otherwise constant)")
 # Optimization
 parser.add_argument("--embedding-lr", type=float, default=0.2, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
@@ -80,6 +87,17 @@ model, tokenizer, meta = load_model("base", device, phase="train", model_tag=arg
 pretrain_batch_size = meta.get("device_batch_size", None)
 if pretrain_batch_size is not None and args.device_batch_size > pretrain_batch_size:
     print0(f"FOOTGUN WARNING: base model training used device_batch_size {pretrain_batch_size}, did you pass in a good --device-batch-size to this script?")
+
+# TriOD: Update model config with triangular and p_s
+if args.triangular:
+    p_s = np.linspace(args.min_p, 1.0, args.num_models) if args.num_models > 0 else np.array([1.0])
+    model.config.triangular = True
+    model.config.p_s = p_s
+    print0(f"TriOD enabled: num_models={args.num_models}, min_p={args.min_p}, p_s={p_s}")
+else:
+    p_s = np.array([1.0])
+    model.config.p_s = p_s
+
 orig_model = model
 model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
@@ -231,11 +249,22 @@ def get_muon_momentum(it):
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
 
+# TriOD: KL alpha scheduler (cosine schedule for gradual knowledge transfer)
+def get_kl_alpha(progress):
+    if args.kl_alpha_max <= 0:
+        return 0.0
+    if args.kl_alpha_cosine:
+        # Cosine schedule: starts at 0, peaks at kl_alpha_max around midpoint
+        return args.kl_alpha_max * 0.5 * (1 - np.cos(np.pi * progress))
+    else:
+        return args.kl_alpha_max
+
 # -----------------------------------------------------------------------------
 # Training loop
 x, y = next(train_loader) # prefetch the very first batch of data
 min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
+smooth_kl_loss = 0 # EMA of KL loss (TriOD)
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 step = 0
@@ -294,14 +323,35 @@ while True:
         break
 
     # -------------------------------------------------------------------------
-    # single training step
+    # single training step with TriOD KL loss
     # evaluate the gradient
     synchronize()
     t0 = time.time()
+    
+    # TriOD: Get KL alpha for this step
+    kl_alpha = get_kl_alpha(progress)
+    criterion = torch.nn.CrossEntropyLoss()
+    
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            B = x.size(0)
+            kl_loss = torch.tensor(0.0, device=device)
+            if args.triangular and args.num_models > 1:
+                # TriOD: compute outputs for all submodels
+                output = model(x, all_models=True)
+                output_full = output[-B:]  # Full model output (last batch)
+                # Compute KL distillation loss from full model to submodels
+                output_submodels = output[:-B]
+                with torch.no_grad():
+                    soft_targets_prob = output_full.softmax(dim=-1)
+                kl_loss = criterion(output_submodels, soft_targets_prob)
+                ce_loss = criterion(output_full, y)
+                loss = ce_loss + kl_alpha * kl_loss
+            else:
+                # Standard training without KL loss
+                loss = model(x, y)
         train_loss = loss.detach() # for logging
+        train_kl_loss = kl_loss.detach()
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
@@ -327,7 +377,9 @@ while True:
 
     # logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
+    smooth_kl_loss = ema_beta * smooth_kl_loss + (1 - ema_beta) * train_kl_loss.item() # EMA the KL loss (TriOD)
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    debiased_smooth_kl = smooth_kl_loss / (1 - ema_beta**(step + 1)) # debias the EMA (TriOD)
     pct_done = 100 * progress
     tok_per_sec = int(args.total_batch_size / dt)
     flops_per_sec = num_flops_per_token * args.total_batch_size / dt
@@ -335,13 +387,16 @@ while True:
     mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
-    print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")
+    # TriOD: Include KL loss and alpha in logging
+    print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | kl: {debiased_smooth_kl:.6f} | kl_α: {kl_alpha:.4f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")
     if step % 10 == 0:
         wandb_run.log({
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
+            "train/kl_loss": debiased_smooth_kl,  # TriOD
+            "train/kl_alpha": kl_alpha,  # TriOD
             "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,

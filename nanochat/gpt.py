@@ -16,6 +16,7 @@ from functools import partial
 from dataclasses import dataclass
 
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,8 +45,7 @@ class GPTConfig:
     n_embd: int = 768
     # TriOD parameters (defaults deactivated)
     triangular: bool = False  # Enable triangular ordered dropout
-    min_p: float = 0.5  # Minimum p for smallest submodel
-    num_models: int = 4  # Number of submodels to train
+    p_s: np.ndarray | None = None  # array of keep ratios for submodels, length=num_models
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long

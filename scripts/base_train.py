@@ -29,7 +29,6 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
-from triod.utils import test_prefix_od
 from scripts.base_eval import evaluate_model
 print_banner()
 
@@ -56,7 +55,6 @@ parser.add_argument("--num-models", type=int, default=0, help="number of submode
 parser.add_argument("--min-p", type=float, default=1.0, help="smallest submodel in TriOD")
 parser.add_argument("--kl-alpha-max", type=float, default=0.0, help="maximum KL alpha for TriOD distillation loss (0 = disabled)")
 parser.add_argument("--kl-alpha-cosine", action="store_true", help="use cosine schedule for KL alpha (otherwise constant)")
-parser.add_argument("--test-prefix-every", type=int, default=0, help="test prefix invariance every N steps (0 = disable)")
 # Optimization
 parser.add_argument("--device-batch-size", type=int, default=16, help="per-device batch size")
 parser.add_argument("--total-batch-size", type=int, default=524288, help="total batch size in tokens")
@@ -149,8 +147,12 @@ if args.depth != 12:
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
+
+# TriOD: p_s for submodel evaluation
+p_s = np.linspace(args.min_p, 1.0, args.num_models) if args.triangular else np.array([1.0])
+
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern, triangular=args.triangular, min_p=args.min_p, num_models=args.num_models)
+model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern, triangular=args.triangular, p_s=p_s)
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
     model_config = GPTConfig(**model_config_kwargs)
@@ -277,19 +279,6 @@ else:
     smooth_kl_loss = loop_state.get("smooth_kl_loss", 0)  # TriOD
     total_training_time = loop_state["total_training_time"]
 
-# TriOD: p_s for submodel evaluation
-p_s = np.linspace(args.min_p, 1.0, args.num_models) if args.triangular else np.array([1.0])
-
-# TriOD: Test prefix invariance
-if args.triangular and args.test_prefix_every > 0 and (last_step or (step > 0 and step % args.test_prefix_every == 0)):
-    if master_process:
-        print0(f"Testing prefix invariance...")
-        model.eval()
-        with autocast_ctx:
-            test_input = torch.randint(0, vocab_size, (2, 32), device=device)
-            test_prefix_od(orig_model, device, test_input, p_s)
-        model.train()
-
 # -----------------------------------------------------------------------------
 # Training loop
 while True:
@@ -388,17 +377,26 @@ while True:
     
     # TriOD: Get KL alpha for this step
     kl_alpha = get_kl_alpha(step)
+    criterion = torch.nn.CrossEntropyLoss()
     
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
+            B = x.size(0)
+            output = model(x, all_models=True)
+            output_full = output[-B:]
+            kl_loss = torch.tensor(0.0)
             if args.triangular and args.num_models > 1:
-                # TriOD: Use forward_with_kl_loss for training with distillation
-                pass
+                # TriOD: compute KL distillation loss from full model to submodels
+                output_submodels = output[:-B]
+                with torch.no_grad():
+                    soft_targets_prob = output[B:].softmax(dim=-1)
+                kl_loss = criterion(output_submodels, soft_targets_prob)
+                ce_loss = criterion(output_full, y)
+                loss = ce_loss + kl_alpha * kl_loss
             else:
                 # Standard training without KL loss
                 loss = model(x, y)
                 ce_loss = loss
-                kl_loss = torch.tensor(0.0)
         train_loss = loss.detach() # for logging
         train_kl_loss = kl_loss.detach() if isinstance(kl_loss, torch.Tensor) else kl_loss
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
