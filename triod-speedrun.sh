@@ -16,16 +16,8 @@ export NANOCHAT_BASE_DIR="/volume/triod/.cache/triod-nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 
 # -----------------------------------------------------------------------------
-# Python venv setup with uv
-
-# install uv (if not already installed)
-command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-# create a .venv local virtual environment (if it doesn't exist)
-[ -d ".venv" ] || uv venv
-# install the repo dependencies
-uv sync --extra gpu
-# activate venv so that `python` uses the project's venv instead of system python
-source .venv/bin/activate
+# Python conda
+conda activate triod
 
 # -----------------------------------------------------------------------------
 # wandb setup
@@ -34,10 +26,7 @@ source .venv/bin/activate
 #    `wandb login`
 # 2) Set the WANDB_RUN environment variable when running this script, e.g.:
 #    `WANDB_RUN=d26 bash speedrun.sh`
-if [ -z "$WANDB_RUN" ]; then
-    # by default use "dummy" : it's handled as a special case, skips logging to wandb
-    WANDB_RUN=dummy
-fi
+WANDB_RUN=triod-nanochat-speedrun
 
 # -----------------------------------------------------------------------------
 # During the course of the run, we will be writing markdown reports to the report/
@@ -65,12 +54,6 @@ python -m scripts.tok_eval
 
 
 # -----------------------------------------------------------------------------
-# TRIOD parameters
-num_models=10
-min_p=0.1
-kl_alpha_max=0.5
-
-# -----------------------------------------------------------------------------
 # Base model (pretraining)
 
 # The d20 model is 561M parameters.
@@ -84,12 +67,18 @@ kl_alpha_max=0.5
 echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
+
+# -----------------------------------------------------------------------------
+# TRIOD parameters
+num_models=10
+min_p=0.1
+kl_alpha_max=0.5
 # Number of processes/GPUs to use
 NPROC_PER_NODE=8
 
 # pretrain the d20 model
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --target-param-data-ratio=20 --run=$WANDB_RUN \
-    --triangular --num-models=$num_models --min-p=$min_p --kl-alpha-max=$kl_alpha_max --kl-alpha-cosine --save_every=1000
+    --triangular --num-models=$num_models --min-p=$min_p --kl-alpha-max=$kl_alpha_max --kl-alpha-cosine --save-every=1000
 # evaluate the model on a larger chunk of train/val data and draw some samples
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss -- \
     --triangular --num-models=$num_models --min-p=$min_p
