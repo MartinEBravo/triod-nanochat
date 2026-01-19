@@ -21,6 +21,7 @@ from contextlib import nullcontext
 import numpy as np
 import wandb
 import torch
+import torch.nn.functional as F
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
@@ -51,12 +52,12 @@ parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate 
 parser.add_argument("--target-param-data-ratio", type=int, default=8, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # TriOD-specific parameters (defaults deactivated)
 parser.add_argument("--triangular", action="store_true", help="use TriOD (triangular ordered dropout) during training")
-parser.add_argument("--num-models", type=int, default=0, help="number of submodels in TriOD (0 = disabled)")
-parser.add_argument("--min-p", type=float, default=1.0, help="smallest submodel in TriOD")
-parser.add_argument("--kl-alpha-max", type=float, default=0.0, help="maximum KL alpha for TriOD distillation loss (0 = disabled)")
+parser.add_argument("--num-models", type=int, default=7, help="number of submodels in TriOD (0 = disabled)")
+parser.add_argument("--min-p", type=float, default=0.1, help="smallest submodel in TriOD")
+parser.add_argument("--kl-alpha-max", type=float, default=0.5, help="maximum KL alpha for TriOD distillation loss (0 = disabled)")
 parser.add_argument("--kl-alpha-cosine", action="store_true", help="use cosine schedule for KL alpha (otherwise constant)")
 # Optimization
-parser.add_argument("--device-batch-size", type=int, default=16, help="per-device batch size")
+parser.add_argument("--device-batch-size", type=int, default=2, help="per-device batch size")
 parser.add_argument("--total-batch-size", type=int, default=524288, help="total batch size in tokens")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
@@ -417,19 +418,19 @@ while True:
         with autocast_ctx:
             B = x.size(0)
             output = model(x, all_models=True)
-            output_full = output[-B:]
+            logits_full = output[-B:]
+            logits_teachers = output[B:]
+            logits_students = output[:-B]
             kl_loss = torch.tensor(0.0)
             if args.triangular and args.num_models > 1:
                 # TriOD: compute KL distillation loss from full model to submodels
-                output_submodels = output[:-B]
-                num_submodels = output_submodels.size(0) // B
-                output_submodels = output_submodels.reshape(num_submodels, B, *output_full.shape[1:])
                 with torch.no_grad():
-                    log_probs_full = torch.log_softmax(output_full, dim=-1)
-                    probs_full = log_probs_full.exp()
-                log_probs_sub = torch.log_softmax(output_submodels, dim=-1)
-                kl_loss = (probs_full.unsqueeze(0) * (log_probs_full.unsqueeze(0) - log_probs_sub)).sum(dim=-1).mean()
-                ce_loss = criterion(output_full, y)
+                    probs_teachers = logits_teachers.softmax(dim=-1) # (B*num_submodels, seq_len, vocab_size)
+                # For each submodel, compute KL divergence to its teacher
+                kl_loss = criterion(logits_students.view(-1, logits_students.size(-1)), probs_teachers.argmax(dim=-1).view(-1))
+                # Compute standard CE loss for the full model
+                ce_loss = F.cross_entropy(logits_full.view(-1, logits_full.size(-1)), y.view(-1), ignore_index=-1)
+                # Combine CE loss and KL loss
                 loss = ce_loss + kl_alpha * kl_loss
             else:
                 # Standard training without KL loss
