@@ -12,7 +12,7 @@
 
 # Default intermediate artifacts directory is in ~/.cache/nanochat
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="/volume/triod/.cache/nanochat"
+export NANOCHAT_BASE_DIR="/volume/triod/.cache/triod-nanochat"
 mkdir -p $NANOCHAT_BASE_DIR
 
 # -----------------------------------------------------------------------------
@@ -89,7 +89,7 @@ NPROC_PER_NODE=8
 
 # pretrain the d20 model
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --target-param-data-ratio=20 --run=$WANDB_RUN \
-    --triangular --num-models=$num_models --min-p=$min_p --kl-alpha-max=$kl_alpha_max --kl-alpha-cosine
+    --triangular --num-models=$num_models --min-p=$min_p --kl-alpha-max=$kl_alpha_max --kl-alpha-cosine --save_every=1000
 # evaluate the model on a larger chunk of train/val data and draw some samples
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss -- \
     --triangular --num-models=$num_models --min-p=$min_p
