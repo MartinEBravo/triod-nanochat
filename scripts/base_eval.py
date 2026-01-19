@@ -7,6 +7,9 @@ python -m scripts.base_eval
 Run with torchrun on e.g. 8 GPUs:
 torchrun --nproc_per_node=8 -m scripts.base_eval
 
+TriOD evaluation (evaluates all submodels):
+torchrun --nproc_per_node=8 -m scripts.base_eval -- --triangular --num-models=10 --min-p=0.1
+
 The script will print the CORE metric to the console.
 """
 import os
@@ -20,6 +23,7 @@ import zipfile
 import tempfile
 from contextlib import nullcontext
 
+import numpy as np
 import torch
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
@@ -45,10 +49,11 @@ def place_eval_bundle(file_path):
         shutil.move(extracted_bundle_dir, eval_bundle_dir)
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
-def evaluate_model(model, tokenizer, device, max_per_task=-1):
+def evaluate_model(model, tokenizer, device, max_per_task=-1, p=None):
     """
     Evaluate a base model on the CORE benchmark.
     - max_per_task: crop the data to this many examples per task for testing (-1 = disable)
+    - p: TriOD submodel keep ratio (None = full model)
     """
     # Load config and task metadata
     base_dir = get_base_dir()
@@ -99,7 +104,7 @@ def evaluate_model(model, tokenizer, device, max_per_task=-1):
             data = data[:max_per_task]
 
         # run the evaluation for this task
-        accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
+        accuracy = evaluate_task(model, tokenizer, data, device, task_meta, p=p)
 
         results[label] = accuracy
         random_baseline = random_baselines[label]
@@ -151,6 +156,10 @@ def main():
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per task to evaluate (-1 = disable)')
     parser.add_argument('--model-tag', type=str, default=None, help='optional model tag for the output directory name')
     parser.add_argument('--step', type=str, default=None, help='optional model step for the output directory name')
+    # TriOD parameters
+    parser.add_argument("--triangular", action="store_true", help="enable TriOD evaluation across all submodels")
+    parser.add_argument("--num-models", type=int, default=0, help="number of submodels in TriOD (0 = disabled)")
+    parser.add_argument("--min-p", type=float, default=1.0, help="smallest submodel in TriOD")
     args = parser.parse_args()
 
     # distributed / precision setup
@@ -172,41 +181,60 @@ def main():
         model_name = f"base_model (step {meta['step']})" # just for logging
         model_slug = f"base_model_{meta['step']:06d}" # for the output csv file
 
-    # Evaluate the model
-    with autocast_ctx:
-        out = evaluate_model(model, tokenizer, device, max_per_task=args.max_per_task)
+    # TriOD: Determine p values to evaluate
+    if args.triangular and args.num_models > 0:
+        p_values = np.linspace(args.min_p, 1.0, args.num_models).tolist()
+        print0(f"TriOD enabled: evaluating {len(p_values)} submodels with p values: {p_values}")
+    else:
+        p_values = [None]  # Single evaluation with full model
 
-    # Write out the results to a csv file
-    core_metric = None
-    centered_results = {}
-    if ddp_rank == 0:
-        base_dir = get_base_dir()
-        output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
-        os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
-        results = out["results"]
-        centered_results = out["centered_results"]
-        core_metric = out["core_metric"]
-        with open(output_csv_path, 'w', encoding='utf-8', newline='') as f:
-            f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")
-            for label in results:
-                f.write(f"{label:<35}, {results[label]:<10.6f}, {centered_results[label]:<10.6f}\n")
-            f.write(f"{'CORE':<35}, {'':<10}, {core_metric:<10.6f}\n")
-        # Print the content of the csv file to console too
-        print0("="*80)
-        print0(f"Model: {model_name}")
-        print0("="*80)
-        with open(output_csv_path, 'r', encoding='utf-8') as f:
-            print0(f.read())
+    # Evaluate the model for each p value
+    all_results = {}  # {p_label: {core_metric, centered_results, results}}
+    for p in p_values:
+        p_label = f"p={p:.2f}" if p is not None else "full"
+        print0(f"\n{'='*80}")
+        print0(f"Evaluating submodel: {p_label}")
+        print0(f"{'='*80}")
+        
+        with autocast_ctx:
+            out = evaluate_model(model, tokenizer, device, max_per_task=args.max_per_task, p=p)
+        all_results[p_label] = out
+
+        # Write out the results to a csv file
+        if ddp_rank == 0:
+            base_dir = get_base_dir()
+            p_suffix = f"_p{p:.2f}" if p is not None else ""
+            output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}{p_suffix}.csv")
+            os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
+            results = out["results"]
+            centered_results = out["centered_results"]
+            core_metric = out["core_metric"]
+            with open(output_csv_path, 'w', encoding='utf-8', newline='') as f:
+                f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")
+                for label in results:
+                    f.write(f"{label:<35}, {results[label]:<10.6f}, {centered_results[label]:<10.6f}\n")
+                f.write(f"{'CORE':<35}, {'':<10}, {core_metric:<10.6f}\n")
+            # Print the content of the csv file to console too
+            print0(f"\nModel: {model_name}, Submodel: {p_label}")
+            print0("-"*60)
+            with open(output_csv_path, 'r', encoding='utf-8') as f:
+                print0(f.read())
 
     # Log to report
     from nanochat.report import get_report
-    get_report().log(section="Base model evaluation", data=[
-        {
+    report_data = []
+    for p_label, out in all_results.items():
+        core_metric = out["core_metric"]
+        centered_results = out["centered_results"]
+        report_data.append({
             "Model": model_name,
+            "Submodel": p_label,
             "CORE metric": core_metric,
-        },
-        centered_results, # the full table
-    ])
+        })
+        # Add centered results as a separate entry
+        report_data.append({f"{p_label} - {k}": v for k, v in centered_results.items()})
+    
+    get_report().log(section="Base model evaluation", data=report_data)
 
     compute_cleanup()
 

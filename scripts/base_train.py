@@ -288,19 +288,33 @@ while True:
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
-        val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with autocast_ctx:
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
+            if args.triangular and p_s.size > 0:
+                val_bpb_by_p = {}
+                for p in p_s:
+                    val_loader = build_val_loader()
+                    bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes, p=float(p))
+                    val_bpb_by_p[float(p)] = bpb
+                val_bpb = val_bpb_by_p[float(p_s[-1])]
+                bpb_parts = " | ".join([f"p={p:.2f}: {bpb:.6f}" for p, bpb in val_bpb_by_p.items()])
+            else:
+                val_loader = build_val_loader()
+                val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+                bpb_parts = f"{val_bpb:.6f}"
+        print0(f"Step {step:05d} | Validation bpb: {bpb_parts}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }
+        if args.triangular and p_s.size > 0:
+            for p, bpb in val_bpb_by_p.items():
+                log_data[f"val/bpb_p{p:.2f}"] = bpb
+        wandb_run.log(log_data)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -309,14 +323,34 @@ while True:
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
         with autocast_ctx:
-            results = evaluate_model(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
+            if args.triangular and p_s.size > 0:
+                results_by_p = {}
+                for p in p_s:
+                    results_by_p[float(p)] = evaluate_model(
+                        orig_model,
+                        tokenizer,
+                        device,
+                        max_per_task=args.core_metric_max_per_task,
+                        p=float(p),
+                    )
+                results = results_by_p[float(p_s[-1])]
+                core_parts = " | ".join(
+                    [f"p={p:.2f}: {res['core_metric']:.4f}" for p, res in results_by_p.items()]
+                )
+            else:
+                results = evaluate_model(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+                core_parts = f"{results['core_metric']:.4f}"
+        print0(f"Step {step:05d} | CORE metric: {core_parts}")
+        log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "core_metric": results["core_metric"],
             "centered_results": results["centered_results"],
-        })
+        }
+        if args.triangular and p_s.size > 0:
+            for p, res in results_by_p.items():
+                log_data[f"core_metric_p{p:.2f}"] = res["core_metric"]
+        wandb_run.log(log_data)
         model.train()
 
     # once in a while: sample from the model (only on master process)
@@ -388,9 +422,13 @@ while True:
             if args.triangular and args.num_models > 1:
                 # TriOD: compute KL distillation loss from full model to submodels
                 output_submodels = output[:-B]
+                num_submodels = output_submodels.size(0) // B
+                output_submodels = output_submodels.reshape(num_submodels, B, *output_full.shape[1:])
                 with torch.no_grad():
-                    soft_targets_prob = output[B:].softmax(dim=-1)
-                kl_loss = criterion(output_submodels, soft_targets_prob)
+                    log_probs_full = torch.log_softmax(output_full, dim=-1)
+                    probs_full = log_probs_full.exp()
+                log_probs_sub = torch.log_softmax(output_submodels, dim=-1)
+                kl_loss = (probs_full.unsqueeze(0) * (log_probs_full.unsqueeze(0) - log_probs_sub)).sum(dim=-1).mean()
                 ce_loss = criterion(output_full, y)
                 loss = ce_loss + kl_alpha * kl_loss
             else:

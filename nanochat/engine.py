@@ -163,17 +163,21 @@ class RowState:
 
 class Engine:
 
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer, p=None):
         self.model = model
         self.tokenizer = tokenizer # needed for tool use
+        self.p = p  # TriOD: submodel keep ratio (None = full model)
 
     @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42, p=None):
         """Same as generate, but does single prefill and then clones the KV cache."""
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
+        
+        # TriOD: use instance p if not overridden
+        p = p if p is not None else self.p
 
         # Get the special tokens we need to coordinate the tool use state machine
         get_special = lambda s: self.tokenizer.encode_special(s)
@@ -194,7 +198,7 @@ class Engine:
             **kv_model_kwargs,
         )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+        logits = self.model.forward(ids, kv_cache=kv_cache_prefill, p=p)
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for each sample/row
@@ -263,20 +267,23 @@ class Engine:
 
             # Prepare logits for next iteration
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+            logits = self.model.forward(ids, kv_cache=kv_cache_decode, p=p)[:, -1, :]  # (B, vocab_size)
 
-    def generate_batch(self, tokens, num_samples=1, **kwargs):
+    def generate_batch(self, tokens, num_samples=1, p=None, **kwargs):
         """
         Non-streaming batch generation that just returns the final token sequences.
         Returns a list of token sequences (list of lists of ints).
         Terminal tokens (assistant_end, bos) are not included in the results.
         """
+        # TriOD: use instance p if not overridden
+        p = p if p is not None else self.p
+        
         assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
         bos = self.tokenizer.get_bos_token_id()
         results = [tokens.copy() for _ in range(num_samples)]
         masks = [[0] * len(tokens) for _ in range(num_samples)]
         completed = [False] * num_samples
-        for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
+        for token_column, token_masks in self.generate(tokens, num_samples, p=p, **kwargs):
             for i, (token, mask) in enumerate(zip(token_column, token_masks)):
                 if not completed[i]:
                     if token == assistant_end or token == bos:

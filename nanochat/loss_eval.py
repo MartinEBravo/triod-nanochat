@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 
 @torch.no_grad()
-def evaluate_bpb(model, batches, steps, token_bytes):
+def evaluate_bpb(model, batches, steps, token_bytes, p=None):
     """
     Instead of the naive 'mean loss', this function returns the bits per byte (bpb),
     which is a tokenization vocab size-independent metric, meaning you are still comparing
@@ -23,6 +23,13 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     In addition to evaluate_loss, we need the token_bytes tensor:
     It is a 1D tensor of shape (vocab_size,), indicating the number of bytes for
     each token id, or 0 if the token is to not be counted (e.g. special tokens).
+    
+    Args:
+        model: The model to evaluate
+        batches: Iterator yielding (x, y) batches
+        steps: Number of batches to evaluate
+        token_bytes: 1D tensor mapping token ids to byte lengths
+        p: TriOD submodel keep ratio (None = full model)
     """
     # record the losses
     total_nats = torch.tensor(0.0, dtype=torch.float32, device=model.get_device())
@@ -30,7 +37,7 @@ def evaluate_bpb(model, batches, steps, token_bytes):
     batch_iter = iter(batches)
     for _ in range(steps):
         x, y = next(batch_iter)
-        loss2d = model(x, y, loss_reduction='none') # (B, T)
+        loss2d = model(x, y, loss_reduction='none', p=p) # (B, T)
         loss2d = loss2d.view(-1) # flatten
         y = y.view(-1) # flatten
         if (y.int() < 0).any(): # mps does not currently have kernel for < 0 for int64, only int32

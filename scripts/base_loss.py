@@ -8,9 +8,13 @@ torchrun --standalone --nproc_per_node=8 -m scripts.base_loss
 
 To evaluate a HuggingFace model:
 python -m scripts.base_loss --hf-path openai-community/gpt2
+
+TriOD evaluation (evaluates all submodels):
+torchrun --standalone --nproc_per_node=8 -m scripts.base_loss -- --triangular --num-models=10 --min-p=0.1
 """
 import argparse
 from contextlib import nullcontext
+import numpy as np
 import torch
 from nanochat.checkpoint_manager import load_model
 from nanochat.common import compute_init, print0, compute_cleanup, autodetect_device_type
@@ -67,6 +71,10 @@ parser.add_argument("--model-tag", type=str, default=None, help="model tag for c
 parser.add_argument("--model-step", type=int, default=None, help="model step to load")
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 parser.add_argument("--hf-path", type=str, default=None, help="HuggingFace model path (e.g. openai-community/gpt2)")
+# TriOD parameters
+parser.add_argument("--triangular", action="store_true", help="enable TriOD evaluation across all submodels")
+parser.add_argument("--num-models", type=int, default=0, help="number of submodels in TriOD (0 = disabled)")
+parser.add_argument("--min-p", type=float, default=1.0, help="smallest submodel in TriOD")
 args = parser.parse_args()
 
 # Load the base model and the tokenizer
@@ -91,21 +99,35 @@ autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
 
 print0(f"Evaluating model: {model_name}")
 
-# Evaluate the loss on each split
+# TriOD: Determine p values to evaluate
+if args.triangular and args.num_models > 0:
+    p_values = np.linspace(args.min_p, 1.0, args.num_models).tolist()
+    print0(f"TriOD enabled: evaluating {len(p_values)} submodels with p values: {p_values}")
+else:
+    p_values = [None]  # Single evaluation with full model
+
+# Evaluate the loss on each split for each p value
 tokens_per_step = args.device_batch_size * sequence_len * ddp_world_size
 assert args.split_tokens % tokens_per_step == 0, "split_tokens must be divisible by tokens_per_step"
 steps = args.split_tokens // tokens_per_step
-bpb_results = {}
-for split_name in ["train", "val"]:
-    loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
-    with autocast_ctx:
-        bpb = evaluate_bpb(model, loader, steps, token_bytes)
-    print0(f"{split_name} bpb: {bpb:.4f}")
-    bpb_results[split_name] = bpb
-    print0(f"Model: {model_name}, {split_name} bpb: {bpb:.6f}")
+all_bpb_results = {}  # {p: {split: bpb}}
+for p in p_values:
+    p_label = f"p={p:.2f}" if p is not None else "full"
+    print0(f"\n{'='*50}")
+    print0(f"Evaluating submodel: {p_label}")
+    print0(f"{'='*50}")
+    bpb_results = {}
+    for split_name in ["train", "val"]:
+        loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
+        with autocast_ctx:
+            bpb = evaluate_bpb(model, loader, steps, token_bytes, p=p)
+        print0(f"{split_name} bpb: {bpb:.4f}")
+        bpb_results[split_name] = bpb
+        print0(f"Model: {model_name}, {p_label}, {split_name} bpb: {bpb:.6f}")
+    all_bpb_results[p_label] = bpb_results
 
 # Master process also samples from the model (only for nanochat models)
-samples = []
+all_samples = {}  # {p: [samples]}
 if ddp_rank == 0 and args.hf_path is None:
     prompts = [
         "The capital of France is",
@@ -116,25 +138,38 @@ if ddp_rank == 0 and args.hf_path is None:
         "My favorite color is",
         "If 5*x + 3 = 13, then x is",
     ]
-    engine = Engine(model, tokenizer)
-    for prompt in prompts:
-        tokens = tokenizer(prompt, prepend="<|bos|>")
-        with autocast_ctx:
-            sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-        sample_str = tokenizer.decode(sample[0])
-        print0(sample_str)
-        samples.append(sample_str)
+    for p in p_values:
+        p_label = f"p={p:.2f}" if p is not None else "full"
+        print0(f"\n{'='*50}")
+        print0(f"Samples from submodel: {p_label}")
+        print0(f"{'='*50}")
+        engine = Engine(model, tokenizer, p=p)
+        samples = []
+        for prompt in prompts:
+            tokens = tokenizer(prompt, prepend="<|bos|>")
+            with autocast_ctx:
+                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+            sample_str = tokenizer.decode(sample[0])
+            print0(sample_str)
+            samples.append(sample_str)
+        all_samples[p_label] = samples
 
 # Log to report
 from nanochat.report import get_report
-get_report().log(section="Base model loss", data=[
-    {
+report_data = []
+for p_label, bpb_results in all_bpb_results.items():
+    report_entry = {
         "model": model_name,
+        "submodel": p_label,
         "train bpb": bpb_results["train"],
         "val bpb": bpb_results["val"],
-    },
-    {f"sample {i}": sample for i, sample in enumerate(samples)},
-])
+    }
+    report_data.append(report_entry)
+    # Add samples for this p value if available
+    if p_label in all_samples:
+        report_data.append({f"sample {i} ({p_label})": sample for i, sample in enumerate(all_samples[p_label])})
+
+get_report().log(section="Base model loss", data=report_data)
 
 # Cleanup
 compute_cleanup()

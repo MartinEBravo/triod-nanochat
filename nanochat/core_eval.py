@@ -142,13 +142,18 @@ def batch_sequences_lm(tokenizer, prompts):
 
 
 @torch.no_grad()
-def forward_model(model, input_ids):
+def forward_model(model, input_ids, p=None):
     """
     Take BxT tensor of token ids, return BxT tensor of losses and argmax predictions.
     The last column of losses is set to nan because we don't have autoregressive targets there.
+    
+    Args:
+        model: The model to evaluate
+        input_ids: BxT tensor of token ids
+        p: TriOD submodel keep ratio (None = full model)
     """
     batch_size, seq_len = input_ids.size()
-    outputs = model(input_ids)
+    outputs = model(input_ids, p=p)
     # Roll the tensor to the left by one position to get the (autoregressive) target ids
     target_ids = torch.roll(input_ids, shifts=-1, dims=1)
     # Calculate cross entropy at all positions
@@ -165,8 +170,18 @@ def forward_model(model, input_ids):
 
 
 @torch.no_grad()
-def evaluate_example(idx, model, tokenizer, data, device, task_meta):
-    """Evaluate a single example, return True if correct, False otherwise"""
+def evaluate_example(idx, model, tokenizer, data, device, task_meta, p=None):
+    """Evaluate a single example, return True if correct, False otherwise
+    
+    Args:
+        idx: Index of the example to evaluate
+        model: The model to evaluate
+        tokenizer: Tokenizer for the model
+        data: List of examples
+        device: Device to run on
+        task_meta: Task metadata (task_type, num_fewshot, continuation_delimiter)
+        p: TriOD submodel keep ratio (None = full model)
+    """
     item = data[idx]
     task_type = task_meta['task_type']
     num_fewshot = task_meta['num_fewshot']
@@ -218,7 +233,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     input_ids = input_ids.to(device)
 
     # Forward the model, get the autoregressive loss and argmax prediction at each token
-    losses, predictions = forward_model(model, input_ids)
+    losses, predictions = forward_model(model, input_ids, p=p)
 
     # See if the losses/predictions come out correctly
     if task_type == 'language_modeling':
@@ -241,17 +256,25 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     return is_correct
 
 
-def evaluate_task(model, tokenizer, data, device, task_meta):
+def evaluate_task(model, tokenizer, data, device, task_meta, p=None):
     """
     This function is responsible for evaluating one task across many examples.
     It also handles dispatch to all processes if the script is run with torchrun.
+    
+    Args:
+        model: The model to evaluate
+        tokenizer: Tokenizer for the model
+        data: List of examples
+        device: Device to run on
+        task_meta: Task metadata
+        p: TriOD submodel keep ratio (None = full model)
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
     # stride the examples to each rank
     for idx in range(rank, len(data), world_size):
-        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
+        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta, p=p)
         correct[idx] = float(is_correct)
     # sync results across all the processes if running distributed
     if world_size > 1:
