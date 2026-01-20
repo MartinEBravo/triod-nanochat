@@ -48,17 +48,17 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
-parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
+parser.add_argument("--num-iterations", type=int, default=21400, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=int, default=4, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # TriOD-specific parameters (defaults deactivated)
 parser.add_argument("--triangular", action="store_true", help="use TriOD (triangular ordered dropout) during training")
-parser.add_argument("--num-models", type=int, default=4, help="number of submodels in TriOD (0 = disabled)")
-parser.add_argument("--min-p", type=float, default=0.4, help="smallest submodel in TriOD")
+parser.add_argument("--num-models", type=int, default=8, help="number of submodels in TriOD (0 = disabled)")
+parser.add_argument("--min-p", type=float, default=0.3, help="smallest submodel in TriOD")
 parser.add_argument("--kl-alpha-max", type=float, default=0.5, help="maximum KL alpha for TriOD distillation loss (0 = disabled)")
 parser.add_argument("--kl-alpha-cosine", action="store_true", help="use cosine schedule for KL alpha (otherwise constant)")
 # Optimization
-parser.add_argument("--device-batch-size", type=int, default=8, help="per-device batch size")
+parser.add_argument("--device-batch-size", type=int, default=4, help="per-device batch size")
 parser.add_argument("--total-batch-size", type=int, default=524288, help="total batch size in tokens")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
@@ -433,12 +433,13 @@ while True:
                 kd_loss = torch.tensor(0.0, device=prelast.device)
                 prev_student = None
                 logits_iter = model.iter_logits_from_prelast_prefix_cumsum(prelast, p_s)
+
                 for teacher_logits in logits_iter:
                     if prev_student is not None and kl_alpha > 0.0:
-                        teacher = teacher_logits.detach()
                         kd_loss = kd_loss + F.cross_entropy(
                             prev_student.view(-1, prev_student.size(-1)),
-                            teacher.argmax(dim=-1).view(-1),
+                            teacher_logits.argmax(dim=-1).view(-1).detach(),
+                            ignore_index=-1,
                         )
                     prev_student = teacher_logits
                 logits_full = prev_student  # (B,T,V)

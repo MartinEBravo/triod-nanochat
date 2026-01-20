@@ -72,7 +72,7 @@ def norm(
         raise ValueError(f"Unsupported shape {tuple(x.shape)} for triod_norm")
 
     # compute triangular RMS norm over head-prefix dimensions
-    s2 = (x4.float() * x4.float()).sum(dim=-1) 
+    s2 = torch.sum(x4 * x4, dim=-1, dtype=torch.float32)
     cs2 = s2.cumsum(dim=-1)                      
     idx = torch.arange(1, n_head + 1, device=x.device, dtype=torch.float32)
     denom = (idx * float(D)).view(1, 1, n_head) 
@@ -490,21 +490,9 @@ class GPT(nn.Module):
         """
         logits = self.lm_head(x)  # (B, T, padded_vocab_size)
         logits = logits[..., :self.config.vocab_size]
-        logits = logits.float()
-        logits = softcap * torch.tanh(logits / softcap)
+        # logits = logits.float()
+        # logits = softcap * torch.tanh(logits / softcap)
         return logits
-
-    def _keep_dims_from_ps(self, p_s, C: int):
-        # p_s is increasing (min_p..1.0) in your code; assume that.
-        keep_dims = [max(1, int(math.ceil(C * float(p)))) for p in p_s]
-        # make monotone nondecreasing (ceil can cause plateaus)
-        out = []
-        last = 0
-        for k in keep_dims:
-            k = max(k, last)
-            out.append(k)
-            last = k
-        return out
 
     def iter_logits_from_prelast_prefix_cumsum(self, prelast, p_s, *, softcap: float = 15.0):
         """
@@ -512,7 +500,10 @@ class GPT(nn.Module):
         total GEMM work ~= one full lm_head, but split into blocks.
         """
         B, T, C = prelast.shape
-        keep_dims = self._keep_dims_from_ps(p_s, C)
+        p = torch.as_tensor(p_s, device=prelast.device, dtype=torch.float32)
+        keep = torch.ceil(C * p).to(torch.int64).clamp_min(1)
+        keep = torch.cummax(keep, dim=0).values
+        keep_dims = keep.tolist()
 
         # Slice vocab once (saves compute vs padded vocab)
         W = self.lm_head.weight[: self.config.vocab_size]  # (V, C)
@@ -530,8 +521,9 @@ class GPT(nn.Module):
                 prev_k = k
 
             # Apply softcap on the current cumulative logits
-            logits = running.float()
-            logits = softcap * torch.tanh(logits / softcap)
+            # logits = running.float()
+            # logits = softcap * torch.tanh(logits / softcap)
+            logits = running
 
             yield logits  # (B,T,V)
 
