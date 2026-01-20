@@ -49,44 +49,40 @@ class GPTConfig:
 
 def norm(
     x,
-    triangular: bool,
+    triangular: bool = False,
     *,
     n_head: int | None = None,
     eps: float = 1e-5,
-    ):
-    # Purely functional rmsnorm with no learnable params
+):
     if not triangular:
         return F.rms_norm(x, (x.size(-1),))
 
     assert n_head is not None, "triangular=True requires n_head"
-    # Case A: (B,T,C) -> reshape into heads
+
     if x.ndim == 3:
         B, T, C = x.shape
-        assert C % n_head == 0, f"C={C} must be divisible by n_head={n_head}"
+        assert C % n_head == 0
         D = C // n_head
         x4 = x.view(B, T, n_head, D)
-    # Case B: (B,T,H,D) already
     elif x.ndim == 4:
         B, T, H, D = x.shape
-        assert H == n_head, f"H={H} must equal n_head={n_head} for triangular head-prefix norm"
+        assert H == n_head
         x4 = x
     else:
         raise ValueError(f"Unsupported shape {tuple(x.shape)} for triod_norm")
-    # per-head sum of squares: (B,T,H)
-    s2 = (x4 * x4).sum(dim=-1)
-    # cumulative sum over heads: stats for heads 0..h
-    cs2 = s2.cumsum(dim=-1)  # (B,T,H)
-    # denom = (h+1)*D
-    idx = torch.arange(1, n_head + 1, device=x.device, dtype=x.dtype)  # (H,)
-    denom = (idx * D).view(1, 1, n_head)  # (1,1,H)
-    mean_sq = cs2 / denom                 # (B,T,H)
-    rms = torch.sqrt(mean_sq.unsqueeze(-1) + eps)  # (B,T,H,1)
-    y4 = x4 / rms
-    # reshape back if needed
-    if x.ndim == 3:
-        return y4.view(B, T, n_head * D)
-    else:
-        return y4
+
+    # compute triangular RMS norm over head-prefix dimensions
+    s2 = (x4.float() * x4.float()).sum(dim=-1) 
+    cs2 = s2.cumsum(dim=-1)                      
+    idx = torch.arange(1, n_head + 1, device=x.device, dtype=torch.float32)
+    denom = (idx * float(D)).view(1, 1, n_head) 
+    mean_sq = cs2 / denom                        
+    rms = torch.sqrt(mean_sq.unsqueeze(-1) + float(eps)) 
+
+    # normalize
+    y4 = x4 / rms.to(dtype=x4.dtype)
+
+    return y4.view(B, T, n_head * D) if x.ndim == 3 else y4
 
 def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
@@ -116,7 +112,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = TriODLinear(self.n_embd, self.n_kv_head * self.head_dim, bias=False, triangular=self.triangular)
         self.c_proj = TriODLinear(self.n_embd, self.n_embd, bias=False, triangular=self.triangular)
         self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = TriODLinear(self.ve_gate_channels, self.n_kv_head, bias=False, triangular=self.triangular) if has_ve(layer_idx, config.n_layer) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache, p=None):
         B, T, C = x.size()
@@ -136,8 +132,9 @@ class CausalSelfAttention(nn.Module):
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 2)
+            ve = ve[..., :keep_kv_heads * self.head_dim] if p is not None else ve # (B, T, keep_kv_heads * D)
+            ve = ve.view(B, T, keep_kv_heads, self.head_dim)
+            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels], p=p))  # (B, T, n_kv_head), range (0, 2)
             v = v + gate.unsqueeze(-1) * ve
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
@@ -455,7 +452,16 @@ class GPT(nn.Module):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, p=p)
-        x = norm(x, triangular=self.config.triangular, n_head=math.ceil(self.config.n_head * (p if p is not None else 1.0)))
+        # Final norm
+        if self.config.triangular and p is not None:
+            keep_heads = max(1, math.ceil(self.config.n_head * p))
+            head_dim = self.config.n_embd // self.config.n_head
+            keep_dim = keep_heads * head_dim
+            x_prefix = x[..., :keep_dim]
+            x = x.clone()
+            x[..., :keep_dim] = norm(x_prefix, triangular=True, n_head=keep_heads)
+        else:
+            x = norm(x)
         # TriOD: Generate outputs for all submodels
         if all_models and self.config.p_s is not None:
             x = generate_structured_masked_x(x, self.config.p_s)
@@ -463,12 +469,9 @@ class GPT(nn.Module):
         # Return pre-logit representations for testing prefix invariance
         if return_prelast:
             return x
+
         # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        logits = self.forward_from_prelast(x)  # (B, T, padded_vocab_size)
 
         if targets is not None:
             # training: given the targets, compute and return the loss
@@ -478,6 +481,59 @@ class GPT(nn.Module):
         else:
             # inference: just return the logits directly
             return logits
+        
+
+    def forward_from_prelast(self, x, softcap = 15):
+        """
+        Given pre-logit representations x, forward through lm_head to get logits.
+        Used for testing prefix invariance.
+        """
+        logits = self.lm_head(x)  # (B, T, padded_vocab_size)
+        logits = logits[..., :self.config.vocab_size]
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)
+        return logits
+
+    def _keep_dims_from_ps(self, p_s, C: int):
+        # p_s is increasing (min_p..1.0) in your code; assume that.
+        keep_dims = [max(1, int(math.ceil(C * float(p)))) for p in p_s]
+        # make monotone nondecreasing (ceil can cause plateaus)
+        out = []
+        last = 0
+        for k in keep_dims:
+            k = max(k, last)
+            out.append(k)
+            last = k
+        return out
+
+    def iter_logits_from_prelast_prefix_cumsum(self, prelast, p_s, *, softcap: float = 15.0):
+        """
+        Yields logits for each p in p_s using blockwise cumsum on lm_head:
+        total GEMM work ~= one full lm_head, but split into blocks.
+        """
+        B, T, C = prelast.shape
+        keep_dims = self._keep_dims_from_ps(p_s, C)
+
+        # Slice vocab once (saves compute vs padded vocab)
+        W = self.lm_head.weight[: self.config.vocab_size]  # (V, C)
+
+        running = None
+        prev_k = 0
+        for k in keep_dims:
+            if k > prev_k:
+                # Compute only the new block contribution
+                x_blk = prelast[..., prev_k:k]      # (B,T,blk)
+                W_blk = W[:, prev_k:k]              # (V,blk)
+                blk_logits = F.linear(x_blk, W_blk) # (B,T,V)
+
+                running = blk_logits if running is None else (running + blk_logits)
+                prev_k = k
+
+            # Apply softcap on the current cumulative logits
+            logits = running.float()
+            logits = softcap * torch.tanh(logits / softcap)
+
+            yield logits  # (B,T,V)
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42, p=None):

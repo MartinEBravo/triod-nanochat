@@ -53,12 +53,12 @@ parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate 
 parser.add_argument("--target-param-data-ratio", type=int, default=4, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # TriOD-specific parameters (defaults deactivated)
 parser.add_argument("--triangular", action="store_true", help="use TriOD (triangular ordered dropout) during training")
-parser.add_argument("--num-models", type=int, default=7, help="number of submodels in TriOD (0 = disabled)")
-parser.add_argument("--min-p", type=float, default=0.1, help="smallest submodel in TriOD")
+parser.add_argument("--num-models", type=int, default=8, help="number of submodels in TriOD (0 = disabled)")
+parser.add_argument("--min-p", type=float, default=0.3, help="smallest submodel in TriOD")
 parser.add_argument("--kl-alpha-max", type=float, default=0.5, help="maximum KL alpha for TriOD distillation loss (0 = disabled)")
 parser.add_argument("--kl-alpha-cosine", action="store_true", help="use cosine schedule for KL alpha (otherwise constant)")
 # Optimization
-parser.add_argument("--device-batch-size", type=int, default=2, help="per-device batch size")
+parser.add_argument("--device-batch-size", type=int, default=16, help="per-device batch size")
 parser.add_argument("--total-batch-size", type=int, default=524288, help="total batch size in tokens")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
@@ -165,10 +165,8 @@ if args.depth != 12:
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-
 # TriOD: p_s for submodel evaluation
 p_s = np.linspace(args.min_p, 1.0, args.num_models) if args.triangular else np.array([1.0])
-
 # Create a new model with random weights
 model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern, triangular=args.triangular, p_s=p_s)
 with torch.device("meta"):
@@ -285,7 +283,6 @@ if not resuming:
     val_bpb = None # will be set if eval_every > 0
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
-    smooth_kl_loss = 0  # EMA of KL loss (TriOD)
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
@@ -293,7 +290,6 @@ else:
     val_bpb = meta_data["val_bpb"]
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
-    smooth_kl_loss = loop_state.get("smooth_kl_loss", 0)  # TriOD
     total_training_time = loop_state["total_training_time"]
 
 # -----------------------------------------------------------------------------
@@ -383,12 +379,14 @@ while True:
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
         ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-        for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
-            with autocast_ctx:
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
+        for p in p_s:
+            print0(f"Step {step:05d} | Sampling from model with p={p:.2f}:")
+            engine = Engine(orig_model, tokenizer, p=float(p)) # use orig_model to avoid recompilation
+            for prompt in prompts:
+                tokens = tokenizer(prompt, prepend="<|bos|>")
+                with autocast_ctx:
+                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0, p=float(p))
+                print0(tokenizer.decode(sample[0]))
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
@@ -409,7 +407,6 @@ while True:
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
-                    "smooth_kl_loss": smooth_kl_loss,  # TriOD
                     "total_training_time": total_training_time,
                 },
             },
@@ -421,39 +418,55 @@ while True:
         break
 
     # -------------------------------------------------------------------------
-    # single training step with TriOD KL loss
+    # single training step
     # evaluate the gradient
     synchronize()
     t0 = time.time()
-    
     # TriOD: Get KL alpha for this step
     kl_alpha = get_kl_alpha(step)
     criterion = torch.nn.CrossEntropyLoss()
-    
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            B = x.size(0)
-            output = model(x, all_models=True)
-            logits_full = output[-B:]
-            logits_teachers = output[B:]
-            logits_students = output[:-B]
-            kl_loss = torch.tensor(0.0)
-            if args.triangular and args.num_models > 1:
-                # TriOD: compute KL distillation loss from full model to submodels
-                with torch.no_grad():
-                    probs_teachers = logits_teachers.softmax(dim=-1) # (B*num_submodels, seq_len, vocab_size)
-                # For each submodel, compute KL divergence to its teacher
-                kl_loss = criterion(logits_students.view(-1, logits_students.size(-1)), probs_teachers.argmax(dim=-1).view(-1))
-                # Compute standard CE loss for the full model
-                ce_loss = F.cross_entropy(logits_full.view(-1, logits_full.size(-1)), y.view(-1), ignore_index=-1)
-                # Combine CE loss and KL loss
-                loss = ce_loss + kl_alpha * kl_loss
+            # inside your training micro_step loop, in autocast_ctx:
+            if len(p_s) > 1:
+                prelast = model(x, return_prelast=True, p=1.0)
+                kd_loss = torch.tensor(0.0, device=prelast.device)
+                prev_student = None
+                logits_iter = model.iter_logits_from_prelast_prefix_cumsum(prelast, p_s, softcap=None)
+                for teacher_logits in logits_iter:
+                    if prev_student is not None and kl_alpha > 0.0:
+                        teacher = teacher_logits.detach()
+                        kd_loss = kd_loss + F.cross_entropy(
+                            prev_student.view(-1, prev_student.size(-1)),
+                            teacher.argmax(dim=-1).view(-1),
+                        )
+                    prev_student = teacher_logits
+                logits_full = prev_student  # (B,T,V)
+                ce_loss = F.cross_entropy(
+                    logits_full.view(-1, logits_full.size(-1)),
+                    y.view(-1),
+                    ignore_index=-1,
+                )
+                kd_loss = kd_loss / (len(p_s) - 1)
+                loss = ce_loss + kl_alpha * kd_loss
+                # logits_full = output[-B:]
+                # logits_teachers = output[B:]
+                # logits_students = output[:-B]
+                # kl_loss = torch.tensor(0.0)
+                # if args.triangular and args.num_models > 1:
+                #     # TriOD: compute KL distillation loss from full model to submodels
+                #     with torch.no_grad():
+                #         probs_teachers = logits_teachers.softmax(dim=-1) # (B*num_submodels, seq_len, vocab_size)
+                #     # For each submodel, compute KL divergence to its teacher
+                #     kl_loss = criterion(logits_students.view(-1, logits_students.size(-1)), probs_teachers.argmax(dim=-1).view(-1))
+                #     # Compute standard CE loss for the full model
+                #     ce_loss = F.cross_entropy(logits_full.view(-1, logits_full.size(-1)), y.view(-1), ignore_index=-1)
+                #     # Combine CE loss and KL loss
+                #     loss = ce_loss + kl_alpha * kl_loss
             else:
                 # Standard training without KL loss
                 loss = model(x, y)
-                ce_loss = loss
         train_loss = loss.detach() # for logging
-        train_kl_loss = kl_loss.detach() if isinstance(kl_loss, torch.Tensor) else kl_loss
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
@@ -479,9 +492,7 @@ while True:
     # logging (CPU action only)
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
-    smooth_kl_loss = ema_beta * smooth_kl_loss + (1 - ema_beta) * (train_kl_loss.item() if isinstance(train_kl_loss, torch.Tensor) else train_kl_loss)  # TriOD
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
-    debiased_smooth_kl = smooth_kl_loss / (1 - ema_beta**(step + 1))  # TriOD
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(args.total_batch_size / dt)
     flops_per_sec = num_flops_per_token * args.total_batch_size / dt
@@ -499,14 +510,13 @@ while True:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
     # TriOD: Include KL loss and alpha in logging
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | kl: {debiased_smooth_kl:.6f} | kl_α: {kl_alpha:.4f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | kl_α: {kl_alpha:.4f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
-            "train/kl_loss": debiased_smooth_kl,  # TriOD
             "train/kl_alpha": kl_alpha,  # TriOD
             "train/lrm": lrm,
             "train/dt": dt,
