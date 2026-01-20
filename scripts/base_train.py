@@ -167,8 +167,10 @@ if args.depth != 12:
 
 # TriOD: p_s for submodel evaluation
 p_s = np.linspace(args.min_p, 1.0, args.num_models) if args.triangular else np.array([1.0])
+p_s_list = [float(p) for p in p_s]  # ensure native Python floats for JSON serialization
+
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern, triangular=args.triangular, p_s=p_s)
+model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern, triangular=args.triangular, p_s=p_s_list)
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
     model_config = GPTConfig(**model_config_kwargs)
