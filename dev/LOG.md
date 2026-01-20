@@ -4,6 +4,109 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-01-17: Various experiments
+
+Modded-nanogpt uses [Value Embeddings](https://arxiv.org/abs/2410.17897) (VEs) in a funny U-shaped structure, 3 of them in total and with gates. I tried a large number of tweaks on this today:
+
+- VEs at every layer, at alternating layers, U shaped, front and back. Alternating layers worked best, i.e. we end up with *a lot* more VEs than modded-nanogpt, at every other layer. It works better.
+- Many parameters sharing ideas to reduce new parameter count, nothing here worked. All failed.
+- Many ideas to reduce parameter count, the LLM hates all of them: low rank decompositions, projections. All failed.
+- Gated yes or no and how much. Gate helps.
+
+Long story short is that the models *love* Value Embeddings. It is a way to add a huge amount of capacity (parameters) to the model at almost zero cost of FLOPs, because these embeddings are simply added to the Values tensor. Any attempt to reduce the capacity of value embeddings (param sharing, low rank, projections) fail. The model wants many of them, and with all the capacity, and doing so wins across all x axes of steps, flops and wall clock. I re-ran the scaling laws and, because the models are now very parameter bloated, the optimal ratio has halved from 8 to 4! Way down lower than Chinchilla's 20 at this point.
+
+Other experiments, looking at val/bpb as a function of all of steps, flops and wall clock time:
+
+- Aspect ratio of 128 is worse than 64, I tried a sweep fixing FLOPs == 1e18 and 64 outperforms. The LLM prefers to be slightly thinner and longer.
+- Head dim definitely prefers to be 128 instead of 64, i.e. fewer bigger heads
+- Bunch of other random stuff like that.
+
+Keeping all of this work on a private branch for now but hope to push shortly.
+
+---
+
+## 2026-01-17: Modded-nanogpt Ideas Sweep (Continued)
+
+Continued testing ideas from modded-nanogpt.
+
+| Idea | Result | Notes |
+|------|--------|-------|
+| Attention gates | No improvement | Per-head learnable gates on attention output. +1GB memory, decreased efficiency. |
+| Batch size schedule | Abandoned | 8→16→24 with LR scaling. Made training script too bloated/complex, not worth cognitive overhead. |
+| Value embeddings | Helps a lot | Experiments still ongoing, more on this later. |
+
+---
+
+## 2026-01-16: Flash Attention 3 Fallback to SDPA
+
+Added automatic fallback from Flash Attention 3 to PyTorch's `scaled_dot_product_attention` (SDPA) for users without Hopper GPUs. This enables nanochat to run on older CUDA GPUs, CPU, and MPS (Apple Silicon).
+
+### Implementation
+
+Created `nanochat/flash_attention.py` - a unified interface that:
+- Detects FA3 availability at import time (requires sm90+ / Hopper)
+- Exports a `flash_attn` object matching FA3's API exactly (`flash_attn.flash_attn_func`, `flash_attn.flash_attn_with_kvcache`)
+- Automatically routes to FA3 or SDPA based on hardware
+- Handles tensor layout differences: FA3 uses (B, T, H, D), SDPA uses (B, H, T, D)
+- Implements sliding window attention via explicit masks for SDPA
+- Manages KV cache manually for SDPA (FA3 does it in-place)
+
+### Changes to Existing Files
+
+Changes to existing code were intentionally kept extremely minimal.
+
+**gpt.py**: Only the import line changed and a comment
+
+**engine.py**: Zero changes needed
+
+**base_train.py**: Added status print and warnings:
+- Prints whether FA3 or SDPA fallback is being used
+- Warns about efficiency loss without FA3
+- Warns about sliding window support if `--window-pattern` is not "L"
+
+### Testing
+
+Tests are split into two classes due to dtype/device constraints:
+
+1. **TestFA3VsSDPA**: Comparison tests requiring Hopper GPU + bfloat16. Run both implementations on identical inputs and verify outputs match (max diff typically 0, at most ~0.004 for sliding window).
+
+2. **TestSDPAOnly**: SDPA-only tests that run on any device with appropriate dtype. Verify forward pass, backward pass, and KV cache work correctly.
+
+Added `_override_impl` mechanism for testing - can force 'fa3' or 'sdpa' to directly compare implementations.
+
+### Notes
+
+- SDPA fallback is significantly slower than FA3 especially in that it lacks the sliding window attention support
+- Recommend `--window-pattern L` (full context) when using SDPA fallback
+
+---
+
+## 2026-01-16: Modded-nanogpt Ideas Sweep (Mostly Negative)
+
+Tested several architectural ideas from modded-nanogpt to see if they transfer to nanochat. All of these did not help:
+
+| Idea | Result | Notes |
+|------|--------|-------|
+| Half-truncated RoPE | No improvement | Only first half of head dims get RoPE (base 1024, linspace). Second half "stationary". |
+| Asymmetric softcap | Slightly worse | `23 * sigmoid((x+5)/7.5)` vs our symmetric `15 * tanh(x/15)`. May only help with FP8. |
+| Smear gate | Negligible | Blend each token with predecessor via learned gate. Tiny improvement not worth n_embd² params. |
+| Backout | No improvement | Save activations at ~60% through network, subtract scaled version at end. |
+| Skip connection | Slightly worse | Save at layer ~25%, add at layer ~50%. Also +2GB memory from storing activations. |
+
+Value Embeddings do show promise. I need a more elaborate exploration of a few related ideas, which I leave for tomorrow.
+
+---
+
+## 2026-01-15: Olmo pretraining mix (Negative result)
+
+I attempted to train on the Olmo 3 pretraining dataset [allenai/dolma3_mix-6T](https://huggingface.co/datasets/allenai/dolma3_mix-6T) instead of FineWeb-edu. I ran into a number of [errors and issues](https://huggingface.co/datasets/allenai/dolma3_mix-6T/discussions/2) trying to both download and process the dataset and then noticed some quality issues (e.g. some documents seem to be extremely short, like "5".). I managed to work around these with some sensible hacks (e.g. reject documents less than 100 characters in length) and tried to process the dataset exactly as FineWeb, re-trained the tokenizer and trained a d16 model. The CORE score decreased from 15.5 to 13.8, i.e. the result is quite a bit worse.
+
+I am still looking to try the [DCLM dataset](https://arxiv.org/abs/2406.11794), which according to the paper should be better that FineWeb-edu. I do have some concerns that the same group both prepared the DCLM dataset *and* introduced the CORE score so I'm a bit hesitant in case there was some overfitting to CORE score adjacent data distribution.
+
+Classifying as negative result and reverting back to FineWeb-edu for now.
+
+---
+
 ## 2026-01-13: Varlen Attention (Negative Result)
 
 Attempted to prevent attention from "leaking" across document boundaries using Flash Attention's `flash_attn_varlen_func`, similar to modded-nanogpt's approach.

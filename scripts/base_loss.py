@@ -154,6 +154,24 @@ if ddp_rank == 0 and args.hf_path is None:
             samples.append(sample_str)
         all_samples[p_label] = samples
 
+# Draw some unconditioned samples from the model (only for nanochat models)
+unconditioned_samples = {}
+if ddp_rank == 0 and args.hf_path is None:
+    for p in p_values:
+        p_label = f"p={p:.2f}" if p is not None else "full"
+        print0(f"\n{'='*50}")
+        print0(f"Unconditioned samples from submodel: {p_label}")
+        print0(f"{'='*50}")
+        engine = Engine(model, tokenizer, p=p)
+        tokens = tokenizer("", prepend="<|bos|>")
+        with autocast_ctx:
+            samples, _ = engine.generate_batch(tokens, num_samples=8, max_tokens=128, temperature=1.0)
+        for sample in samples:
+            sample_str = tokenizer.decode(sample)
+            print0("-" * 80)
+            print0(sample_str)
+            unconditioned_samples.append(sample_str)
+
 # Log to report
 from nanochat.report import get_report
 report_data = []
@@ -168,6 +186,7 @@ for p_label, bpb_results in all_bpb_results.items():
     # Add samples for this p value if available
     if p_label in all_samples:
         report_data.append({f"sample {i} ({p_label})": sample for i, sample in enumerate(all_samples[p_label])})
+        report_data.append({"unconditioned sample": sample for i, sample in enumerate(unconditioned_samples)})
 
 get_report().log(section="Base model loss", data=report_data)
 
