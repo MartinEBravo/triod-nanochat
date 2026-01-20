@@ -53,8 +53,8 @@ parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate 
 parser.add_argument("--target-param-data-ratio", type=int, default=4, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # TriOD-specific parameters (defaults deactivated)
 parser.add_argument("--triangular", action="store_true", help="use TriOD (triangular ordered dropout) during training")
-parser.add_argument("--num-models", type=int, default=8, help="number of submodels in TriOD (0 = disabled)")
-parser.add_argument("--min-p", type=float, default=0.3, help="smallest submodel in TriOD")
+parser.add_argument("--num-models", type=int, default=4, help="number of submodels in TriOD (0 = disabled)")
+parser.add_argument("--min-p", type=float, default=0.4, help="smallest submodel in TriOD")
 parser.add_argument("--kl-alpha-max", type=float, default=0.5, help="maximum KL alpha for TriOD distillation loss (0 = disabled)")
 parser.add_argument("--kl-alpha-cosine", action="store_true", help="use cosine schedule for KL alpha (otherwise constant)")
 # Optimization
