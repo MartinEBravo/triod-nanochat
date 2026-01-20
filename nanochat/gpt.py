@@ -140,12 +140,6 @@ class CausalSelfAttention(nn.Module):
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 2)
             v = v + gate.unsqueeze(-1) * ve
 
-        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
-        if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 2)
-            v = v + gate.unsqueeze(-1) * ve
-
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
@@ -157,20 +151,10 @@ class CausalSelfAttention(nn.Module):
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
-            if q.is_cuda:
-                target_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-                q = q.to(dtype=target_dtype)
-                k = k.to(dtype=target_dtype)
-                v = v.to(dtype=target_dtype)
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            if q.is_cuda:
-                target_dtype = k_cache.dtype
-                q = q.to(dtype=target_dtype)
-                k = k.to(dtype=target_dtype)
-                v = v.to(dtype=target_dtype)
             y = flash_attn.flash_attn_with_kvcache(
                 q, k_cache, v_cache,
                 k=k, v=v,
@@ -227,9 +211,9 @@ class Block(nn.Module):
         if p is not None:
             x = x.clone()
             x[..., :keep_dim] = x_slice
-            return x
         else:
-            return x_slice
+            x = x_slice
+        return x
 
 
 class GPT(nn.Module):
@@ -393,8 +377,7 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
+        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel + self.resid_lambdas.numel() + self.x0_lambdas.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -466,45 +449,20 @@ class GPT(nn.Module):
 
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
-        x = norm(x, triangular=self.config.triangular, n_head=self.config.n_head)
+        x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
-
-        # TriOD: Quantize p to align with head boundaries
-        if p is not None:
-            head_dim = self.config.n_embd // self.config.n_head
-            keep_heads = max(1, math.ceil(self.config.n_head * p))
-            keep_dim = keep_heads * head_dim
-            # Recalculate p based on head-aligned dimension
-            p = keep_dim / self.config.n_embd
-
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, p=p)
-        
-        # Final norm with triangular head-prefix norm
-        if p is not None:
-            keep_heads = max(1, math.ceil(self.config.n_head * p))
-            head_dim = self.config.n_embd // self.config.n_head
-            keep_dim = keep_heads * head_dim
-            # Slice x for normalization
-            x_slice = x[..., :keep_dim]
-            x_slice = norm(x_slice, triangular=self.config.triangular, n_head=keep_heads)
-            # Put normalized slice back for prefix invariance
-            x = x.clone()
-            x[..., :keep_dim] = x_slice
-        else:
-            keep_heads = self.config.n_head
-            x = norm(x, triangular=self.config.triangular, n_head=keep_heads)
-
-        # Return pre-logit representations for testing prefix invariance
-        if return_prelast:
-            return x
-
+        x = norm(x, triangular=self.config.triangular, n_head=math.ceil(self.config.n_head * (p if p is not None else 1.0)))
         # TriOD: Generate outputs for all submodels
         if all_models and self.config.p_s is not None:
             x = generate_structured_masked_x(x, self.config.p_s)
 
+        # Return pre-logit representations for testing prefix invariance
+        if return_prelast:
+            return x
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
