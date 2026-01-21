@@ -440,8 +440,7 @@ while True:
                     if prev_student is not None and kl_alpha > 0.0:
                         kd_loss = kd_loss + F.cross_entropy(
                             prev_student.view(-1, prev_student.size(-1)),
-                            teacher_logits.argmax(dim=-1).view(-1).detach(),
-                            ignore_index=-1,
+                            teacher_logits.softmax(dim=-1).view(-1, teacher_logits.size(-1)).detach()
                         )
                     prev_student = teacher_logits
                 logits_full = prev_student  # (B,T,V)
