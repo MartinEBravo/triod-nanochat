@@ -341,6 +341,7 @@ while True:
             if args.triangular and p_s.size > 0:
                 results_by_p = {}
                 for p in p_s:
+                    print0(f"Evaluating CORE metric at p={p:.2f}...")
                     results_by_p[float(p)] = evaluate_model(
                         orig_model,
                         tokenizer,
@@ -381,14 +382,13 @@ while True:
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
         ]
-        for p in p_s:
-            print0(f"Step {step:05d} | Sampling from model with p={p:.2f}:")
-            engine = Engine(orig_model, tokenizer, p=float(p)) # use orig_model to avoid recompilation
-            for prompt in prompts:
-                tokens = tokenizer(prompt, prepend="<|bos|>")
-                with autocast_ctx:
-                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0, p=float(p))
-                print0(tokenizer.decode(sample[0]))
+        print0(f"Step {step:05d} | Sampling from model:")
+        engine = Engine(orig_model, tokenizer, p=1.0) # use orig_model to avoid recompilation
+        for prompt in prompts:
+            tokens = tokenizer(prompt, prepend="<|bos|>")
+            with autocast_ctx:
+                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0, p=1.0)
+            print0(tokenizer.decode(sample[0]))
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step

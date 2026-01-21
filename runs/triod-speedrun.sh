@@ -72,9 +72,13 @@ wait $DATASET_DOWNLOAD_PID
 # Number of processes/GPUs to use
 NPROC_PER_NODE=8
 
+# Test save
+# torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --target-param-data-ratio=20 --run=$WANDB_RUN \
+#     --triangular --kl-alpha-cosine --save-every=1 --eval-every=1 --core-metric-every=1 --sample-every=-1
+
 # pretrain the d20 model
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_train -- --depth=20 --target-param-data-ratio=20 --run=$WANDB_RUN \
-    --triangular --kl-alpha-cosine --save-every=1000
+    --triangular --save-every=1000
 # evaluate the model on a larger chunk of train/val data and draw some samples
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE -m scripts.base_loss -- \
     --triangular --num-models=$num_models --min-p=$min_p
