@@ -73,7 +73,7 @@ print("x device:", x.device)
 model.eval()
 
 with torch.inference_mode():
-    9(
+    (
         model=model,
         device=device,
         dataloader=dataloader,
