@@ -31,8 +31,8 @@ num_kv_heads = num_heads  # default is 1:1 GQA (Group Query Attention) ratio (i.
 
 # TriOD parameters (disabled by default like base_train)
 triangular = True
-num_models = 10
-min_p = 0.1
+num_models = 4
+min_p = 0.4
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -57,7 +57,8 @@ amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 model = GPT(model_config).to(device).to(dtype=amp_dtype)
 model.init_weights()
 
-B, T = 2, 128
+T = 2048
+B = 4
 x = torch.randint(0, vocab_size, (B, T), device=device, dtype=torch.long)
 y = torch.randint(0, vocab_size, (B, T), device=device, dtype=torch.long)
 
@@ -72,7 +73,7 @@ print("x device:", x.device)
 model.eval()
 
 with torch.inference_mode():
-    test_prefix_od(
+    9(
         model=model,
         device=device,
         dataloader=dataloader,

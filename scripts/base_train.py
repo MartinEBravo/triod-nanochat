@@ -55,7 +55,7 @@ parser.add_argument("--target-param-data-ratio", type=int, default=4, help="calc
 parser.add_argument("--triangular", action="store_true", help="use TriOD (triangular ordered dropout) during training")
 parser.add_argument("--num-models", type=int, default=4, help="number of submodels in TriOD (0 = disabled)")
 parser.add_argument("--min-p", type=float, default=0.4, help="smallest submodel in TriOD")
-parser.add_argument("--kl-alpha-max", type=float, default=0.5, help="maximum KL alpha for TriOD distillation loss (0 = disabled)")
+parser.add_argument("--kl-alpha-max", type=float, default=0.01, help="maximum KL alpha for TriOD distillation loss (0 = disabled)")
 parser.add_argument("--kl-alpha-cosine", action="store_true", help="use cosine schedule for KL alpha (otherwise constant)")
 # Optimization
 parser.add_argument("--device-batch-size", type=int, default=4, help="per-device batch size")
@@ -72,12 +72,12 @@ parser.add_argument("--warmdown-ratio", type=float, default=0.4, help="ratio of 
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
-parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
+parser.add_argument("--eval-every", type=int, default=15, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=20*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
-parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--save-every", type=int, default=2000, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -427,30 +427,55 @@ while True:
     # TriOD: Get KL alpha for this step
     kl_alpha = get_kl_alpha(step)
     criterion = torch.nn.CrossEntropyLoss()
+    T = 2.0  # temperature for distillation
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            # inside your training micro_step loop, in autocast_ctx:
-            if len(p_s) > 1:
-                prelast = model(x, return_prelast=True, p=1.0)
-                kd_loss = torch.tensor(0.0, device=prelast.device)
-                prev_student = None
-                logits_iter = model.iter_logits_from_prelast_prefix_cumsum(prelast, p_s)
+            # teacher: full model
+            teacher_logits = model(x, p=1.0)              # (B,T,V)
+            teacher_probs  = F.softmax(teacher_logits / T, dim=-1).detach()
 
-                for teacher_logits in logits_iter:
-                    if prev_student is not None and kl_alpha > 0.0:
-                        kd_loss = kd_loss + F.cross_entropy(
-                            prev_student.view(-1, prev_student.size(-1)),
-                            teacher_logits.softmax(dim=-1).view(-1, teacher_logits.size(-1)).detach()
-                        )
-                    prev_student = teacher_logits
-                logits_full = prev_student  # (B,T,V)
-                ce_loss = F.cross_entropy(
-                    logits_full.view(-1, logits_full.size(-1)),
-                    y.view(-1),
-                    ignore_index=-1,
-                )
-                kd_loss = kd_loss / (len(p_s) - 1)
-                loss = ce_loss + kl_alpha * kd_loss
+            # CE for full model (or for p=1.0)
+            ce_loss = F.cross_entropy(
+                teacher_logits.view(-1, teacher_logits.size(-1)),
+                y.view(-1),
+                ignore_index=-1,
+            )
+
+            kd_loss = 0.0
+            for p in p_s[:-1]:  # all except 1.0
+                student_logits = model(x, p=float(p))     # (B,T,V)
+
+                # KL(student || teacher) using log-probs
+                kd_loss = kd_loss + F.kl_div(
+                    F.log_softmax(student_logits / T, dim=-1),
+                    teacher_probs,
+                    reduction="batchmean",
+                ) * (T * T)
+
+            kd_loss = kd_loss / max(1, (len(p_s) - 1))
+            loss = ce_loss + kl_alpha * kd_loss
+        # with autocast_ctx:
+        #     # inside your training micro_step loop, in autocast_ctx:
+        #     if len(p_s) > 1:
+        #         prelast = model(x, return_prelast=True)
+        #         kd_loss = torch.tensor(0.0, device=prelast.device)
+        #         student_logits = None
+        #         logits_iter = model.iter_logits_from_prelast_prefix_cumsum(prelast, p_s)
+
+        #         for teacher_logits in logits_iter:
+        #             if student_logits is not None and kl_alpha > 0.0:
+        #                 kd_loss = kd_loss + F.cross_entropy(
+        #                     student_logits.view(-1, student_logits.size(-1)),
+        #                     teacher_logits.softmax(dim=-1).view(-1, teacher_logits.size(-1)).detach()
+        #                 )
+        #             student_logits = teacher_logits
+        #         logits_full = student_logits
+        #         ce_loss = F.cross_entropy(
+        #             logits_full.view(-1, logits_full.size(-1)),
+        #             y.view(-1)
+        #         )
+        #         kd_loss = kd_loss / (len(p_s) - 1)
+        #         loss = ce_loss + kl_alpha * kd_loss
                 # logits_full = output[-B:]
                 # logits_teachers = output[B:]
                 # logits_students = output[:-B]
@@ -465,9 +490,9 @@ while True:
                 #     ce_loss = F.cross_entropy(logits_full.view(-1, logits_full.size(-1)), y.view(-1), ignore_index=-1)
                 #     # Combine CE loss and KL loss
                 #     loss = ce_loss + kl_alpha * kl_loss
-            else:
-                # Standard training without KL loss
-                loss = model(x, y)
+            # else:
+            #     # Standard training without KL loss
+            #     loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
