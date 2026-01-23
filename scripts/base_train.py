@@ -368,7 +368,6 @@ def train(epoch):
         kl_loss = 0.0
         prev_logits = None
         for i, logits_i in enumerate(compute_cum_outputs(prelast, net.classifier, p_s)):
-
             # Hierarchical Knowledge Distillation, current logit is the teacher, previous is student
             if args.use_hkd:
                 if prev_logits is None: # first iteration
@@ -386,11 +385,9 @@ def train(epoch):
                 teacher_logits = full_logits # Teacher is full model
 
             # KL loss
-            with torch.no_grad():
-                probs_teacher = teacher_logits.softmax(dim=-1)
             kl_loss = kl_loss + F.cross_entropy(
                 student_logits,
-                probs_teacher,
+                teacher_logits.softmax(dim=-1).detach()
             )
 
         kl_loss /= (len(p_s) - 1)
