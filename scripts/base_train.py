@@ -23,6 +23,7 @@ import wandb
 import torch
 import torch.nn.functional as F
 
+from triod.utils import compute_cum_outputs
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
@@ -431,29 +432,29 @@ while True:
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             # teacher: full model
-            teacher_logits = model(x, p=1.0)              # (B,T,V)
-            teacher_probs  = F.softmax(teacher_logits / T, dim=-1).detach()
+            prelast = model(x, return_prelast=True)
+            full_logits = model.lm_head(prelast)
 
-            # CE for full model (or for p=1.0)
+            # CE for full model
             ce_loss = F.cross_entropy(
-                teacher_logits.view(-1, teacher_logits.size(-1)),
+                full_logits.view(-1, full_logits.size(-1)),
                 y.view(-1),
                 ignore_index=-1,
             )
 
-            kd_loss = 0.0
-            for p in p_s[:-1]:  # all except 1.0
-                student_logits = model(x, p=float(p))     # (B,T,V)
+            kl_loss = 0.0
+            for i, teacher_logits in enumerate(compute_cum_outputs(prelast, model.lm_head, p_s)):
+                if i == 0:
+                    student_logits = teacher_logits
+                    continue 
+                kl_loss = kl_loss + F.cross_entropy(
+                    student_logits.view(-1, student_logits.size(-1)),
+                    teacher_logits.softmax(dim=-1).view(-1, teacher_logits.size(-1)).detach()
+                )
+            
 
-                # KL(student || teacher) using log-probs
-                kd_loss = kd_loss + F.kl_div(
-                    F.log_softmax(student_logits / T, dim=-1),
-                    teacher_probs,
-                    reduction="batchmean",
-                ) * (T * T)
-
-            kd_loss = kd_loss / max(1, (len(p_s) - 1))
-            loss = ce_loss + kl_alpha * kd_loss
+            kl_loss /= (len(p_s) - 1)
+            loss = ce_loss + kl_alpha * kl_loss
         # with autocast_ctx:
         #     # inside your training micro_step loop, in autocast_ctx:
         #     if len(p_s) > 1:
