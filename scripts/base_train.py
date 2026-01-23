@@ -1,600 +1,486 @@
-"""
-Train model with TriOD (Triangular Ordered Dropout) support. From root directory of the project, run as:
+# -*- coding: utf-8 -*-
+'''
+Train CIFAR10/CIFAR100 with PyTorch and Vision Transformers!
+written by @kentaroy47, @arutema47
+modified to support CIFAR100
+'''
 
-python -m scripts.base_train.py
+from __future__ import print_function
 
-or distributed as:
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import torch.backends.cudnn as cudnn
+import numpy as np
+import math
 
-torchrun --nproc_per_node=8 -m scripts.base_train.py
-
-If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
-"""
+import torchvision
+import torchvision.transforms as transforms
 
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import argparse
-import math
+import pandas as pd
+import csv
 import time
-from contextlib import nullcontext
 
-import numpy as np
-import wandb
-import torch
-import torch.nn.functional as F
+from models import *
+from utils import progress_bar
+from randomaug import RandAugment
+from models.vit import ViT
+from models.convmixer import ConvMixer
+from models.mobilevit import mobilevit_xxs
+from models.dyt import DyT
 
-from triod.utils import compute_cum_outputs
-from nanochat.gpt import GPT, GPTConfig
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
-from nanochat.loss_eval import evaluate_bpb
-from nanochat.engine import Engine
-from nanochat.flash_attention import HAS_FA3
-from scripts.base_eval import evaluate_model
-print_banner()
+# parsers
+parser = argparse.ArgumentParser(description='PyTorch CIFAR10/100/ImageNet Training')
+parser.add_argument('--lr', default=0.015, type=float, help='learning rate') # resnets.. 1e-3, Vit..1e-4
+parser.add_argument('--opt', default="sgd")
+parser.add_argument('--resume', '-r', action='store_true', help='resume from checkpoint')
+parser.add_argument('--noaug', action='store_false', help='disable use randomaug')
+parser.add_argument('--noamp', action='store_true', help='disable mixed precision training. for older pytorch versions')
+parser.add_argument('--nowandb', action='store_true', help='disable wandb')
+parser.add_argument('--mixup', action='store_true', help='add mixup augumentations')
+parser.add_argument('--net', default='res18')
+parser.add_argument('--dp', action='store_true', help='use data parallel')
+parser.add_argument('--gpu', default='all', type=str, help='GPU id to use.')
+parser.add_argument('--bs', default='128')
+parser.add_argument('--size', default="32")
+parser.add_argument('--n_epochs', type=int, default='200')
+parser.add_argument('--patch', default='4', type=int, help="patch for ViT")
+parser.add_argument('--dimhead', default="512", type=int)
+parser.add_argument('--convkernel', default='8', type=int, help="parameter for convmixer")
+parser.add_argument('--dataset', default='cifar10', type=str, help='dataset to use (cifar10, cifar100, imagenet)')
+parser.add_argument('--kl_alpha_max', default=0.6, type=float, help='maximum kl alpha for DyT')
+parser.add_argument('--min_p', default=0.2, type=float, help='minimum p for TriOD models')
+parser.add_argument('--n_models', default=5, type=int, help='number of models for TriOD models')
+parser.add_argument('--use_hkd', action='store_true', help='use hierarchical knowledge distillation for TriOD models')
 
-# -----------------------------------------------------------------------------
-# CLI arguments
-parser = argparse.ArgumentParser(description="Pretrain base model")
-# Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
-# Runtime
-parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
-# Model architecture
-parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
-parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
-parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
-parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
-# Training horizon (only one used, in order of precedence)
-parser.add_argument("--num-iterations", type=int, default=21400, help="explicit number of optimization steps (-1 = disable)")
-parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
-parser.add_argument("--target-param-data-ratio", type=int, default=4, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
-# TriOD-specific parameters (defaults deactivated)
-parser.add_argument("--triangular", action="store_true", help="use TriOD (triangular ordered dropout) during training")
-parser.add_argument("--num-models", type=int, default=4, help="number of submodels in TriOD (0 = disabled)")
-parser.add_argument("--min-p", type=float, default=0.4, help="smallest submodel in TriOD")
-parser.add_argument("--kl-alpha-max", type=float, default=0.01, help="maximum KL alpha for TriOD distillation loss (0 = disabled)")
-parser.add_argument("--kl-alpha-cosine", action="store_true", help="use cosine schedule for KL alpha (otherwise constant)")
-# Optimization
-parser.add_argument("--device-batch-size", type=int, default=4, help="per-device batch size")
-parser.add_argument("--total-batch-size", type=int, default=524288, help="total batch size in tokens")
-parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
-parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
-parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
-parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
-parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
-parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
-parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
-parser.add_argument("--warmdown-ratio", type=float, default=0.4, help="ratio of iterations for LR warmdown")
-parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
-parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
-# Evaluation
-parser.add_argument("--eval-every", type=int, default=15, help="evaluate val bpb every N steps (-1 = disable)")
-parser.add_argument("--eval-tokens", type=int, default=20*524288, help="number of tokens to evaluate val loss on")
-parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
-parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
-parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
-parser.add_argument("--save-every", type=int, default=2000, help="save checkpoints every N steps (-1 = only at end)")
-# Output
-parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+triangular = True
+
 args = parser.parse_args()
-user_config = vars(args).copy()  # for logging
-# -----------------------------------------------------------------------------
 
-# Compute init
-device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
-if device_type == "cuda":
-    gpu_device_name = torch.cuda.get_device_name(0)
-    gpu_peak_flops = get_peak_flops(gpu_device_name)
-    print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
+# take in args
+usewandb = not args.nowandb
+if usewandb:
+    import wandb
+    watermark = "{}_lr{}_{}".format(args.net, args.lr, args.dataset)
+    wandb.init(project="triod",
+            name=watermark)
+    wandb.config.update(args)
+
+bs = int(args.bs)
+imsize = int(args.size)
+
+use_amp = not args.noamp
+aug = args.noaug
+
+
+if not args.gpu=='all' and not args.dp:
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+device = "cuda" if torch.cuda.is_available() else "cpu"
+best_acc = 0  # best test accuracy
+start_epoch = 0  # start from epoch 0 or last checkpoint epoch
+
+# Data
+print('==> Preparing data..')
+if args.net=="vit_timm":
+    size = 384
 else:
-    gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
+    size = imsize
 
-# wandb logging init
-use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+# Set up normalization based on the dataset
+if args.dataset == 'cifar10':
+    mean = (0.4914, 0.4822, 0.4465)
+    std = (0.2023, 0.1994, 0.2010)
+    num_classes = 10
+    dataset_class = torchvision.datasets.CIFAR10
+elif args.dataset == 'cifar100':
+    mean = (0.5071, 0.4867, 0.4408)
+    std = (0.2675, 0.2565, 0.2761)
+    num_classes = 100
+    dataset_class = torchvision.datasets.CIFAR100
+elif args.dataset=="imagenet":
+    # TODO: implement hugging face dataset for imagenet and turn it into a pytorch dataset
+    pass
 
-# Flash Attention status
-if HAS_FA3:
-    print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
 else:
-    print0("!" * 80)
-    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
-    print0("WARNING: Training will be less efficient without FA3")
-    if args.window_pattern != "L":
-        print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
-        print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
-    print0("!" * 80)
+    raise ValueError("Dataset must be either 'cifar10', 'cifar100', or 'imagenet'")
 
-# Tokenizer will be useful for evaluation, also we need the vocab size
-tokenizer = get_tokenizer()
-token_bytes = get_token_bytes(device=device)
-vocab_size = tokenizer.get_vocab_size()
-print0(f"Vocab size: {vocab_size:,}")
-
-# Model kwargs are derived from the desired depth of the model
-# We nudge model_dim up to the nearest multiple of head_dim to ensure clean division
-# (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
-# (For very small depths, this gives a slight "unfair" advantage to models with odd depths)
-num_layers = args.depth
-base_dim = args.depth * args.aspect_ratio
-model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
-num_heads = model_dim // args.head_dim
-num_kv_heads = num_heads # default is 1:1 GQA (Group Query Attention) ratio (i.e. GQA is disabled)
-head_dim = model_dim // num_heads
-print0(f"num_layers: {num_layers}")
-print0(f"model_dim: {model_dim} (base: {base_dim}, nudge: {model_dim - base_dim:+d})")
-print0(f"num_heads: {num_heads}")
-print0(f"head_dim: {head_dim}")
-print0(f"num_kv_heads: {num_kv_heads}")
-
-# Optimizer / data / training length related hyperparameters
-# figure out the needed gradient accumulation to reach the desired total batch size
-tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
-world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
-assert args.total_batch_size % world_tokens_per_fwdbwd == 0
-grad_accum_steps = args.total_batch_size // world_tokens_per_fwdbwd
-print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
-print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
-print0(f"Total batch size {args.total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
-
-# Batch size scaling for learning rates (hyperparameters were tuned at reference batch size 2^19)
-batch_lr_scale = 1.0
-reference_batch_size = 2**19
-batch_ratio = args.total_batch_size / reference_batch_size
-if batch_ratio != 1.0:
-    # SGD: linear scaling with batch size is standard (not used in nanochat)
-    # AdamW: sqrt scaling is standard
-    # Muon: sqrt scaling is an assumption - not fully studied, but it's a second-order-ish optimizer
-    batch_lr_scale = batch_ratio ** 0.5
-    print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {args.total_batch_size:,} (reference: {reference_batch_size:,})")
-
-# Weight decay is tuned at d12 and its scaling seems to be \propto 1/channels^2 (or equivalently, \propto 1/depth^2 due to constant aspect ratio)
-weight_decay_scaled = args.weight_decay * (12 / args.depth)**2
-if args.depth != 12:
-    print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
-
-# -----------------------------------------------------------------------------
-# Initialize the Model
-
-# TriOD: p_s for submodel evaluation
-p_s = np.linspace(args.min_p, 1.0, args.num_models) if args.triangular else np.array([1.0])
-p_s_list = [float(p) for p in p_s]  # ensure native Python floats for JSON serialization
-
-# Create a new model with random weights
-model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim, window_pattern=args.window_pattern, triangular=args.triangular, p_s=p_s_list)
-with torch.device("meta"):
-    # All tensors are created as meta tensors (they have shape/dtype but no data)
-    model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
-model.to_empty(device=device) # All tensors get storage on target device but with uninitialized (garbage) data
-model.init_weights() # All tensors get initialized
-
-# If we are resuming, overwrite the model parameters with those of the checkpoint
-base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
-resuming = args.resume_from_step != -1
-if resuming:
-    print0(f"Resuming optimization from step {args.resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
-    model.load_state_dict(model_data, strict=True, assign=True)
-    del model_data # free up this memory after the copy
-
-orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
-num_params = sum(p.numel() for p in model.parameters())
-num_scaling_params = orig_model.num_scaling_params()
-print0(f"Number of parameters: {num_params:,} (scaling: {num_scaling_params:,})")
-num_flops_per_token = model.estimate_flops()
-print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
-
-# Calculate number of iterations. Either it is given, or from target flops, or from target data:param ratio (in that order)
-assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
-if args.num_iterations > 0:
-    num_iterations = args.num_iterations
-    print0(f"Using user-provided number of iterations: {num_iterations:,}")
-elif args.target_flops > 0:
-    # calculate the number of iterations from the target flops
-    num_iterations = round(args.target_flops / (num_flops_per_token * args.total_batch_size))
-    print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
-elif args.target_param_data_ratio > 0:
-    # calculate the number of iterations from the target param data ratio (use scaling params per Kaplan et al.)
-    target_tokens = args.target_param_data_ratio * num_scaling_params
-    num_iterations = target_tokens // args.total_batch_size
-    print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
-else:
-    raise ValueError("No training horizon specified")
-total_tokens = args.total_batch_size * num_iterations
-print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Params ratio: {args.total_batch_size * num_iterations / num_scaling_params:.2f}") # Chinchilla is ~20
-print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
-
-# -----------------------------------------------------------------------------
-# Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
-adam_betas = (args.adam_beta1, args.adam_beta2)
-optimizers = model.setup_optimizers(
-    unembedding_lr=args.unembedding_lr * batch_lr_scale,
-    embedding_lr=args.embedding_lr * batch_lr_scale,
-    matrix_lr=args.matrix_lr * batch_lr_scale,
-    weight_decay=weight_decay_scaled,
-    adam_betas=adam_betas,
-    scalar_lr=args.scalar_lr * batch_lr_scale,
-)
-adamw_optimizer, muon_optimizer = optimizers
-
-if resuming:
-    for opt, dat in zip(optimizers, optimizer_data):
-        opt.load_state_dict(dat)
-    del optimizer_data # free up the memory
-
-# -----------------------------------------------------------------------------
-# Initialize the DataLoaders for train/val
-dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
-
-# -----------------------------------------------------------------------------
-# Set up hyperparameter schedulers
-
-# Learning rate scheduler
-def get_lr_multiplier(it):
-    warmup_iters = round(args.warmup_ratio * num_iterations)
-    warmdown_iters = round(args.warmdown_ratio * num_iterations)
-    if it < warmup_iters:
-        return (it + 1) / warmup_iters
-    elif it <= num_iterations - warmdown_iters:
-        return 1.0
-    else:
-        progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
-
-# TriOD: KL alpha scheduler (cosine schedule for gradual knowledge transfer)
-def get_kl_alpha(it):
-    """Get KL alpha with optional cosine schedule."""
-    if args.kl_alpha_cosine:
-        # Cosine schedule: starts at 0, reaches kl_alpha_max at end
-        return args.kl_alpha_max * (1 - math.cos(math.pi * it / num_iterations)) / 2.0
-    else:
-        return args.kl_alpha_max
-
-# Momentum scheduler for Muon optimizer
-def get_muon_momentum(it):
-    frac = min(it / 300, 1)
-    momentum = (1 - frac) * 0.85 + frac * 0.95
-    return momentum
-
-# Weight decay scheduler for Muon optimizer (linear to zero over the course of training)
-def get_weight_decay(it):
-    return weight_decay_scaled * (1 - it / num_iterations)
-
-# -----------------------------------------------------------------------------
-# Loop state (variables updated by the training loop)
-
-if not resuming:
-    step = 0
-    val_bpb = None # will be set if eval_every > 0
-    min_val_bpb = float("inf")
-    smooth_train_loss = 0 # EMA of training loss
-    total_training_time = 0 # total wall-clock time of training
-else:
-    step = meta_data["step"]
-    loop_state = meta_data["loop_state"]
-    val_bpb = meta_data["val_bpb"]
-    min_val_bpb = loop_state["min_val_bpb"]
-    smooth_train_loss = loop_state["smooth_train_loss"]
-    total_training_time = loop_state["total_training_time"]
-
-# -----------------------------------------------------------------------------
-# Training loop
-while True:
-    last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    flops_so_far = num_flops_per_token * args.total_batch_size * step
-
-    # once in a while: evaluate the val bpb (all ranks participate)
-    if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
-        model.eval()
-        eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with autocast_ctx:
-            if args.triangular and p_s.size > 0:
-                val_bpb_by_p = {}
-                for p in p_s:
-                    val_loader = build_val_loader()
-                    bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes, p=float(p))
-                    val_bpb_by_p[float(p)] = bpb
-                val_bpb = val_bpb_by_p[float(p_s[-1])]
-                bpb_parts = " | ".join([f"p={p:.2f}: {bpb:.6f}" for p, bpb in val_bpb_by_p.items()])
-            else:
-                val_loader = build_val_loader()
-                val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-                bpb_parts = f"{val_bpb:.6f}"
-        print0(f"Step {step:05d} | Validation bpb: {bpb_parts}")
-        if val_bpb < min_val_bpb:
-            min_val_bpb = val_bpb
-        log_data = {
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "val/bpb": val_bpb,
-        }
-        if args.triangular and p_s.size > 0:
-            for p, bpb in val_bpb_by_p.items():
-                log_data[f"val/bpb_p{p:.2f}"] = bpb
-        wandb_run.log(log_data)
-        model.train()
-
-    # once in a while: estimate the CORE metric (all ranks participate)
-    # use the original uncompiled model because the inputs keep changing shape
-    results = {}
-    if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
-        model.eval()
-        with autocast_ctx:
-            if args.triangular and p_s.size > 0:
-                results_by_p = {}
-                for p in p_s:
-                    print0(f"Evaluating CORE metric at p={p:.2f}...")
-                    results_by_p[float(p)] = evaluate_model(
-                        orig_model,
-                        tokenizer,
-                        device,
-                        max_per_task=args.core_metric_max_per_task,
-                        p=float(p),
-                    )
-                results = results_by_p[float(p_s[-1])]
-                core_parts = " | ".join(
-                    [f"p={p:.2f}: {res['core_metric']:.4f}" for p, res in results_by_p.items()]
-                )
-            else:
-                results = evaluate_model(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
-                core_parts = f"{results['core_metric']:.4f}"
-        print0(f"Step {step:05d} | CORE metric: {core_parts}")
-        log_data = {
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        }
-        if args.triangular and p_s.size > 0:
-            for p, res in results_by_p.items():
-                log_data[f"core_metric_p{p:.2f}"] = res["core_metric"]
-        wandb_run.log(log_data)
-        model.train()
-
-    # once in a while: sample from the model (only on master process)
-    # use the original uncompiled model because the inputs keep changing shape
-    if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
-        model.eval()
-        prompts = [
-            "The capital of France is",
-            "The chemical symbol of gold is",
-            "If yesterday was Friday, then tomorrow will be",
-            "The opposite of hot is",
-            "The planets of the solar system are:",
-            "My favorite color is",
-            "If 5*x + 3 = 13, then x is",
-        ]
-        print0(f"Step {step:05d} | Sampling from model:")
-        engine = Engine(orig_model, tokenizer, p=1.0) # use orig_model to avoid recompilation
-        for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
-            with autocast_ctx:
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0, p=1.0)
-            print0(tokenizer.decode(sample[0]))
-        model.train()
-
-    # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(), # model parameters
-            [opt.state_dict() for opt in optimizers], # optimizer states
-            { # metadata saved as json
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
-                "model_config": model_config_kwargs,
-                "user_config": user_config, # inputs to the training script
-                "device_batch_size": args.device_batch_size,
-                "max_seq_len": args.max_seq_len,
-                "dataloader_state_dict": dataloader_state_dict,
-                "loop_state": { # all loop state (other than step) so that we can resume training
-                    "min_val_bpb": min_val_bpb,
-                    "smooth_train_loss": smooth_train_loss,
-                    "total_training_time": total_training_time,
-                },
-            },
-            rank=ddp_rank,
-        )
-
-    # termination conditions (TODO: possibly also add loss explosions etc.)
-    if last_step:
-        break
-
-    # -------------------------------------------------------------------------
-    # single training step
-    # evaluate the gradient
-    synchronize()
-    t0 = time.time()
-    # TriOD: Get KL alpha for this step
-    kl_alpha = get_kl_alpha(step)
-    criterion = torch.nn.CrossEntropyLoss()
-    T = 2.0  # temperature for distillation
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            # teacher: full model
-            prelast = model(x, return_prelast=True)
-            full_logits = model.lm_head(prelast)
-
-            # CE for full model
-            ce_loss = F.cross_entropy(
-                full_logits.view(-1, full_logits.size(-1)),
-                y.view(-1),
-                ignore_index=-1,
-            )
-
-            kl_loss = 0.0
-            for i, teacher_logits in enumerate(compute_cum_outputs(prelast, model.lm_head, p_s)):
-                if i == 0:
-                    student_logits = teacher_logits
-                    continue 
-                kl_loss = kl_loss + F.cross_entropy(
-                    student_logits.view(-1, student_logits.size(-1)),
-                    teacher_logits.softmax(dim=-1).view(-1, teacher_logits.size(-1)).detach()
-                )
-            
-
-            kl_loss /= (len(p_s) - 1)
-            loss = ce_loss + kl_alpha * kl_loss
-        # with autocast_ctx:
-        #     # inside your training micro_step loop, in autocast_ctx:
-        #     if len(p_s) > 1:
-        #         prelast = model(x, return_prelast=True)
-        #         kd_loss = torch.tensor(0.0, device=prelast.device)
-        #         student_logits = None
-        #         logits_iter = model.iter_logits_from_prelast_prefix_cumsum(prelast, p_s)
-
-        #         for teacher_logits in logits_iter:
-        #             if student_logits is not None and kl_alpha > 0.0:
-        #                 kd_loss = kd_loss + F.cross_entropy(
-        #                     student_logits.view(-1, student_logits.size(-1)),
-        #                     teacher_logits.softmax(dim=-1).view(-1, teacher_logits.size(-1)).detach()
-        #                 )
-        #             student_logits = teacher_logits
-        #         logits_full = student_logits
-        #         ce_loss = F.cross_entropy(
-        #             logits_full.view(-1, logits_full.size(-1)),
-        #             y.view(-1)
-        #         )
-        #         kd_loss = kd_loss / (len(p_s) - 1)
-        #         loss = ce_loss + kl_alpha * kd_loss
-                # logits_full = output[-B:]
-                # logits_teachers = output[B:]
-                # logits_students = output[:-B]
-                # kl_loss = torch.tensor(0.0)
-                # if args.triangular and args.num_models > 1:
-                #     # TriOD: compute KL distillation loss from full model to submodels
-                #     with torch.no_grad():
-                #         probs_teachers = logits_teachers.softmax(dim=-1) # (B*num_submodels, seq_len, vocab_size)
-                #     # For each submodel, compute KL divergence to its teacher
-                #     kl_loss = criterion(logits_students.view(-1, logits_students.size(-1)), probs_teachers.argmax(dim=-1).view(-1))
-                #     # Compute standard CE loss for the full model
-                #     ce_loss = F.cross_entropy(logits_full.view(-1, logits_full.size(-1)), y.view(-1), ignore_index=-1)
-                #     # Combine CE loss and KL loss
-                #     loss = ce_loss + kl_alpha * kl_loss
-            # else:
-            #     # Standard training without KL loss
-            #     loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # step the optimizers
-    lrm = get_lr_multiplier(step)
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(step)
-    for group in muon_optimizer.param_groups:
-        group["momentum"] = muon_momentum
-        group["weight_decay"] = muon_weight_decay
-    for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
-    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
-    synchronize()
-    t1 = time.time()
-    dt = t1 - t0
-    # -------------------------------------------------------------------------
-
-    # logging (CPU action only)
-    ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
-    pct_done = 100 * step / num_iterations
-    tok_per_sec = int(args.total_batch_size / dt)
-    flops_per_sec = num_flops_per_token * args.total_batch_size / dt
-    mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
-    if step > 10:
-        total_training_time += dt # only count the time after the first 10 steps
-    # Calculate ETA based on average time per step (excluding first 10 steps)
-    steps_done = step - 10
-    if steps_done > 0:
-        avg_time_per_step = total_training_time / steps_done
-        remaining_steps = num_iterations - step
-        eta_seconds = remaining_steps * avg_time_per_step
-        eta_str = f" | eta: {eta_seconds/60:.1f}m"
-    else:
-        eta_str = ""
-    epoch = dataloader_state_dict["epoch"]
-    # TriOD: Include KL loss and alpha in logging
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | kl_α: {kl_alpha:.4f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
-        log_data = {
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "train/loss": debiased_smooth_loss,
-            "train/kl_alpha": kl_alpha,  # TriOD
-            "train/lrm": lrm,
-            "train/dt": dt,
-            "train/tok_per_sec": tok_per_sec,
-            "train/mfu": mfu,
-            "train/epoch": epoch,
-        }
-        wandb_run.log(log_data)
-
-    # state update
-    step += 1
-
-# print a few more stats
-print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
-print0(f"Total training time: {total_training_time/60:.2f}m")
-if val_bpb is not None:
-    print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
-
-# Log to report
-from nanochat.report import get_report
-get_report().log(section="Base model training", data=[
-    user_config, # CLI args
-    { # stats about the training setup
-        "Number of parameters": num_params,
-        "Number of FLOPs per token": f"{num_flops_per_token:e}",
-        "Calculated number of iterations": num_iterations,
-        "Number of training tokens": total_tokens,
-        "Tokens : Params ratio": args.total_batch_size * num_iterations / num_params,
-        "DDP world size": ddp_world_size,
-        "warmup_ratio": args.warmup_ratio,
-        "warmdown_ratio": args.warmdown_ratio,
-        "final_lr_frac": args.final_lr_frac,
-        # TriOD parameters
-        "triangular": args.triangular,
-        "min_p": args.min_p,
-        "num_models": args.num_models,
-        "kl_alpha_max": args.kl_alpha_max,
-        "kl_alpha_cosine": args.kl_alpha_cosine,
-    },
-    { # stats about training outcomes
-        "Minimum validation bpb": min_val_bpb if val_bpb is not None else None,
-        "Final validation bpb": val_bpb,
-        "CORE metric estimate": results.get("core_metric", None),
-        "MFU %": f"{mfu:.2f}%",
-        "Total training flops": f"{flops_so_far:e}",
-        "Total training time": f"{total_training_time/60:.2f}m",
-        "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
-    }
+transform_train = transforms.Compose([
+    transforms.RandomCrop(32, padding=4),
+    transforms.Resize(size),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize(mean, std),
 ])
 
-# cleanup
-wandb_run.finish() # wandb run finish
-compute_cleanup()
+transform_test = transforms.Compose([
+    transforms.Resize(size),
+    transforms.ToTensor(),
+    transforms.Normalize(mean, std),
+])
+
+# Add RandAugment with N, M(hyperparameter)
+if aug:  
+    N = 2; M = 14;
+    transform_train.transforms.insert(0, RandAugment(N, M))
+
+# Prepare dataset
+trainset = dataset_class(root='./data', train=True, download=True, transform=transform_train)
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=bs, shuffle=True, num_workers=8)
+
+testset = dataset_class(root='./data', train=False, download=True, transform=transform_test)
+testloader = torch.utils.data.DataLoader(testset, batch_size=100, shuffle=False, num_workers=8)
+
+# Set up class names based on the dataset
+if args.dataset == 'cifar10':
+    classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+else:
+    # CIFAR100 has 100 classes and Imagenet has 1000 classes,
+    # so we don't list them all here
+    classes = None
+
+p_s = np.linspace(args.min_p, 1.0, num=args.n_models)
+# Model factory..
+print('==> Building model..')
+# net = VGG('VGG19')
+if args.net=='res18':
+    net = ResNet18(num_classes=num_classes, triangular=triangular, p_s=p_s)
+elif args.net=='vgg':
+    net = VGG('VGG19', num_classes=num_classes, triangular=triangular, p_s=p_s)
+elif args.net=='res34':
+    net = ResNet34(num_classes=num_classes, triangular=triangular, p_s=p_s)
+elif args.net=='res50':
+    net = ResNet50(num_classes=num_classes, triangular=triangular, p_s=p_s)
+elif args.net=='res101':
+    net = ResNet101(num_classes=num_classes, triangular=triangular, p_s=p_s)
+elif args.net=="convmixer":
+    # from paper, accuracy >96%. you can tune the depth and dim to scale accuracy and speed.
+    net = ConvMixer(256, 16, kernel_size=args.convkernel, patch_size=1, n_classes=num_classes)
+elif args.net=="mlpmixer":
+    from models.mlpmixer import MLPMixer
+    net = MLPMixer(
+    image_size = 32,
+    channels = 3,
+    patch_size = args.patch,
+    dim = 512,
+    depth = 6,
+    num_classes = num_classes
+)
+elif args.net=="vit_small":
+    from models.vit_small import ViT
+    net = ViT(
+    image_size = size,
+    patch_size = args.patch,
+    num_classes = num_classes,
+    dim = int(args.dimhead),
+    depth = 6,
+    heads = 8,
+    mlp_dim = 512,
+    dropout = 0.1,
+    emb_dropout = 0.1,
+    triangular = triangular,
+    p_s = p_s
+)
+elif args.net=="vit_tiny":
+    from models.vit_small import ViT
+    net = ViT(
+    image_size = size,
+    patch_size = args.patch,
+    num_classes = num_classes,
+    dim = int(args.dimhead),
+    depth = 4,
+    heads = 6,
+    mlp_dim = 256,
+    dropout = 0.1,
+    emb_dropout = 0.1,
+    triangular = triangular,
+    p_s = p_s
+)
+elif args.net=="simplevit":
+    from models.simplevit import SimpleViT
+    net = SimpleViT(
+    image_size = size,
+    patch_size = args.patch,
+    num_classes = num_classes,
+    dim = int(args.dimhead),
+    depth = 6,
+    heads = 8,
+    mlp_dim = 512
+)
+elif args.net=="vit":
+    # ViT for cifar10/100
+    net = ViT(
+    image_size = size,
+    patch_size = args.patch,
+    num_classes = num_classes,
+    dim = int(args.dimhead),
+    depth = 6,
+    heads = 8,
+    mlp_dim = 512,
+    dropout = 0.1,
+    emb_dropout = 0.1,
+    triangular = triangular,
+    p_s = p_s
+)
+elif args.net=="dyt":
+    # DyT for cifar10/100
+    net = DyT(
+    image_size = size,
+    patch_size = args.patch,
+    num_classes = num_classes,
+    dim = int(args.dimhead),
+    depth = 6,
+    heads = 8,
+    mlp_dim = 512,
+    dropout = 0.1,
+    emb_dropout = 0.1
+)
+elif args.net=="vit_timm":
+    import timm
+    net = timm.create_model("vit_base_patch16_384", pretrained=True)
+    net.head = nn.Linear(net.head.in_features, num_classes)
+elif args.net=="cait":
+    from models.cait import CaiT
+    net = CaiT(
+    image_size = size,
+    patch_size = args.patch,
+    num_classes = num_classes,
+    dim = int(args.dimhead),
+    depth = 6,   # depth of transformer for patch to patch attention only
+    cls_depth=2, # depth of cross attention of CLS tokens to patch
+    heads = 8,
+    mlp_dim = 512,
+    dropout = 0.1,
+    emb_dropout = 0.1,
+    layer_dropout = 0.05
+)
+elif args.net=="cait_small":
+    from models.cait import CaiT
+    net = CaiT(
+    image_size = size,
+    patch_size = args.patch,
+    num_classes = num_classes,
+    dim = int(args.dimhead),
+    depth = 6,   # depth of transformer for patch to patch attention only
+    cls_depth=2, # depth of cross attention of CLS tokens to patch
+    heads = 6,
+    mlp_dim = 256,
+    dropout = 0.1,
+    emb_dropout = 0.1,
+    layer_dropout = 0.05
+)
+elif args.net=="swin":
+    from models.swin import swin_t
+    net = swin_t(window_size=args.patch,
+                num_classes=num_classes,
+                downscaling_factors=(2,2,2,1))
+elif args.net=="mobilevit":
+    net = mobilevit_xxs(size, num_classes)
+else:
+    raise ValueError(f"'{args.net}' is not a valid model")
+
+# net to cuda
+net = net.to(device)
+classification_head = net.classifier
+
+
+# Check triod prefix OD implementation
+from triod.utils import compute_cum_outputs, test_prefix_od
+assert test_prefix_od(net, torch.device("cuda"), trainloader, p_s=p_s), "Prefix OD test failed"
+
+# For Multi-GPU
+if 'cuda' in device:
+    print(device)
+    if args.dp:
+        print("using data parallel")
+        net = torch.nn.DataParallel(net) # make parallel
+        cudnn.benchmark = True
+
+if args.resume:
+    # Load checkpoint.
+    print('==> Resuming from checkpoint..')
+    assert os.path.isdir('checkpoint'), 'Error: no checkpoint directory found!'
+    checkpoint_path = './checkpoint/{}-{}-{}-ckpt.t7'.format(args.net, args.dataset, args.patch)
+    checkpoint = torch.load(checkpoint_path,
+        map_location=torch.device("cuda"),
+        weights_only=True
+    )
+    net.load_state_dict(checkpoint['net'])
+    best_acc = checkpoint['acc']
+    start_epoch = checkpoint['epoch']
+
+# Loss is CE
+criterion = nn.CrossEntropyLoss()
+
+if args.opt == "adam":
+    optimizer = optim.Adam(net.parameters(), lr=args.lr)
+elif args.opt == "sgd":
+    decay, no_decay = [], []
+    for name, p in net.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.dim() == 1 or name.endswith(".bias"):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    optimizer = torch.optim.SGD(
+        [
+            {"params": decay, "weight_decay": 5e-4},
+            {"params": no_decay, "weight_decay": 0},
+        ],
+        lr=args.lr,
+        momentum=0.9,
+    )
+    optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+    
+# use cosine scheduling
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.n_epochs)
+
+##### Training
+scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+def train(epoch):
+    print('\nEpoch: %d' % epoch)
+    net.train()
+    train_loss = 0
+    kl_alpha_max = (
+        args.kl_alpha_max
+        * (1 - math.cos(math.pi * epoch / args.n_epochs))
+        / 2.0
+    )
+    for batch_idx, (inputs, targets) in enumerate(trainloader):
+        inputs, targets = inputs.to(device), targets.to(device)
+
+        # output = net(inputs, all_models=True)
+        prelast = net(inputs, return_prelast=True)
+        full_logits = classification_head(prelast)
+        # full model lost 
+        ce_loss = F.cross_entropy(
+            full_logits,
+            targets,
+            ignore_index=-1
+        )
+
+        #####################################################
+        ###########  Knowledge Distillation Loss ############
+        #####################################################
+        kl_loss = 0.0
+        prev_logits = None
+        for i, logits_i in enumerate(compute_cum_outputs(prelast, net.classifier, p_s)):
+
+            # Hierarchical Knowledge Distillation, current logit is the teacher, previous is student
+            if args.use_hkd:
+                if prev_logits is None: # first iteration
+                    prev_logits = logits_i
+                    continue
+                student_logits = prev_logits # Student is previous logit
+                teacher_logits = logits_i # Teacher is current logit
+                prev_logits = logits_i # update for next iteration
+            
+            # Knowledge Distillation, current logit is the student, teacher is full model
+            else:
+                if i == len(p_s) - 1:
+                    break # skip full model
+                student_logits = logits_i # Student is current logit
+                teacher_logits = full_logits # Teacher is full model
+
+            # KL loss
+            with torch.no_grad():
+                probs_teacher = teacher_logits.softmax(dim=-1)
+            kl_loss = kl_loss + F.cross_entropy(
+                student_logits,
+                probs_teacher,
+            )
+
+        kl_loss /= (len(p_s) - 1)
+        loss = ce_loss + kl_alpha_max * kl_loss
+
+        # output_full = output[-B:]
+        # kl_loss = 0.0
+        # if len(p_s)>1:
+        #     output_submodels = output[:-B]
+        #     output_teachers = output[B:]
+        #     with torch.no_grad():
+        #         prob_teachers = output_teachers.softmax(dim=1)
+        #     kl_loss = criterion(output_submodels, prob_teachers)
+
+        # Backward + step
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+
+        train_loss += loss.item()
+        progress_bar(batch_idx, len(trainloader), 'Loss: %.3f' % (train_loss/(batch_idx+1)))
+
+    return train_loss/(batch_idx+1)
+
+##### Validation
+def test(epoch):
+    global best_acc
+    net.eval()
+    losses = np.zeros(len(p_s))
+    accs = np.zeros(len(p_s))
+    with torch.no_grad():
+        for batch_idx, (inputs, targets) in enumerate(testloader):
+            inputs, targets = inputs.to(device), targets.to(device)
+            for i in range(len(p_s)):
+                output = net(inputs, p=p_s[i])
+                loss = criterion(output, targets)
+                losses[i] += loss.item()
+                _, predicted = output.max(1)
+                accs[i] += predicted.eq(targets).sum().item()/targets.size(0)
+            progress_bar(batch_idx, len(testloader))
+
+    accs = 100*np.array(accs)/(batch_idx+1)
+    losses = losses/(batch_idx+1)
+    for i, p in enumerate(p_s):
+        print("p={:.2f} | Loss: {:.3f} | Acc: {:.3f}%".format(p, losses[i], accs[i]))
+
+    # Save checkpoint.
+    acc = np.mean(accs)
+    if acc > best_acc:
+        print('Saving..')
+        state = {
+            "net": net.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict(),
+            "acc": acc,
+            "epoch": epoch,
+        }
+        if not os.path.isdir('checkpoint'):
+            os.mkdir('checkpoint')
+        torch.save(state, './checkpoint/{}-{}-{}-ckpt.t7'.format(args.net, args.dataset, args.patch))
+        best_acc = acc
+    return losses, accs
+
+if usewandb:
+    wandb.watch(net)
+    
+net.cuda()
+for epoch in range(start_epoch, args.n_epochs):
+    start = time.time()
+    trainloss = train(epoch)
+    val_losses, val_accs = test(epoch)
+    
+    scheduler.step() # step cosine scheduling
+    
+    # Log training..
+    if usewandb:
+        log_payload = {
+            'epoch': epoch,
+            'train_loss': trainloss,
+            'mean_loss': np.mean(val_losses),
+            "mean_acc": np.mean(val_accs),
+            "lr": optimizer.param_groups[0]["lr"],
+            "epoch_time": time.time()-start,
+        }
+        for i, p in enumerate(p_s):
+            log_payload[f"acc_p_{p:.2f}"] = val_accs[i]
+            log_payload[f"loss_p_{p:.2f}"] = val_losses[i]
+        wandb.log(log_payload)
+
+# writeout wandb
+if usewandb:
+    wandb.save("wandb_{}_{}.h5".format(args.net, args.dataset))
